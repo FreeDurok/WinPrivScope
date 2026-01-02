@@ -1,4 +1,4 @@
-# AD-Enum.ps1 - Script di Enumerazione Active Directory
+# AD-Enum.ps1 - Script di Enumerazione Active Directory Completo
 # Uso: .\AD-Enum.ps1 oppure Import-Module .\AD-Enum.ps1; Invoke-ADEnum
 
 #region Funzioni Helper
@@ -723,15 +723,6 @@ function Get-ACLAbuse {
         Write-Info "Nessun permesso pericoloso trovato su utenti non privilegiati"
     }
     
-    Write-Section "Comandi utili (se hai PowerView)"
-    Write-Host "    # Trova permessi GenericAll" -ForegroundColor Yellow
-    Write-Host '    Get-ObjectAcl -Identity "gruppo" | ? {$_.ActiveDirectoryRights -eq "GenericAll"} | select SecurityIdentifier,ActiveDirectoryRights' -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "    # Sfrutta GenericAll su gruppo" -ForegroundColor Yellow
-    Write-Host '    net group "NomeGruppo" tuouser /add /domain' -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "    # Sfrutta GenericAll su utente (cambia password)" -ForegroundColor Yellow
-    Write-Host '    net user targetuser NuovaPassword123! /domain' -ForegroundColor Gray
 }
 
 #endregion
@@ -796,7 +787,7 @@ function Get-LocalAdminAccess {
         Write-Info "Nessun accesso admin locale trovato con l'utente corrente"
     }
     
-    return $adminAccess
+    return 
 }
 
 function Get-LoggedOnUsersRemoteRegistry {
@@ -936,36 +927,6 @@ function Get-DomainSessionsWMI {
     }
 }
 
-function Get-InterestingTargets {
-    Write-Banner "TARGET INTERESSANTI"
-    
-    Write-Section "Analisi Attack Path"
-    
-    # Trova admin
-    $admins = @()
-    $adminQuery = LDAPSearch -LDAPQuery "(&(objectCategory=group)(cn=Domain Admins))"
-    if ($adminQuery) {
-        $members = $adminQuery.Properties.member
-        foreach ($m in $members) {
-            if ($m -match "CN=([^,]+)") {
-                $admins += $matches[1]
-            }
-        }
-    }
-    
-    Write-SubSection "Domain Admins identificati"
-    foreach ($admin in $admins) {
-        Write-Finding "Admin" $admin -Important
-    }
-    
-    Write-Host ""
-    Write-Info "Prossimi passi suggeriti:"
-    Write-Host "    1. Trova dove sono loggati i Domain Admins" -ForegroundColor White
-    Write-Host "    2. Verifica se hai admin access su quei computer" -ForegroundColor White
-    Write-Host "    3. Estrai credenziali con Mimikatz" -ForegroundColor White
-    Write-Host "    4. Esegui lateral movement" -ForegroundColor White
-}
-
 #endregion
 
 #region Main Function
@@ -998,24 +959,14 @@ function Invoke-ADEnum {
         Get-LocalAdminAccess
         Get-DomainLoggedOnUsers
         Get-DomainSessionsWMI
-        Get-InterestingTargets
     }
     
     # Riepilogo finale
     $endTime = Get-Date
     $duration = $endTime - $startTime
     
-    Write-Banner "RIEPILOGO ENUMERAZIONE"
+    Write-Host ""
     Write-Host "[*] Completato in: $($duration.TotalSeconds.ToString('0.00')) secondi" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "[!] PROSSIMI PASSI CONSIGLIATI:" -ForegroundColor Yellow
-    Write-Host "    1. Controlla utenti AS-REP Roastable" -ForegroundColor White
-    Write-Host "    2. Controlla service account Kerberoastable" -ForegroundColor White
-    Write-Host "    3. Verifica computer con admin access" -ForegroundColor White
-    Write-Host "    4. Trova dove sono loggati i Domain Admins" -ForegroundColor White
-    Write-Host "    5. Cerca credenziali in SYSVOL/GPP" -ForegroundColor White
-    Write-Host "    6. Testa password spray con utenti trovati" -ForegroundColor White
-    Write-Host ""
 }
 
 #endregion
