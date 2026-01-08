@@ -304,6 +304,18 @@ function Get-DomainComputers {
     
     $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
     
+    # Helper per risolvere IP da hostname
+    function Resolve-HostIP {
+        param([string]$Hostname)
+        if (-not $Hostname) { return "N/A" }
+        try {
+            $ips = [System.Net.Dns]::GetHostAddresses($Hostname) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+            if ($ips) { return ($ips | Select-Object -First 1).IPAddressToString }
+            return "N/A"
+        }
+        catch { return "N/A" }
+    }
+    
     Write-Section "Domain Controllers"
     $dcs = LDAPSearch -LDAPQuery "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))"
     foreach ($dc in $dcs) {
@@ -311,9 +323,11 @@ function Get-DomainComputers {
         $os = $dc.Properties.operatingsystem[0]
         $osVer = $dc.Properties.operatingsystemversion[0]
         $dns = $dc.Properties.dnshostname[0]
+        $ip = Resolve-HostIP -Hostname $dns
         
         Write-SubSection $name
         Write-Finding "DNS" $dns
+        Write-Finding "IP" $ip -Important
         Write-Finding "OS" "$os $osVer" -Important
     }
     
@@ -324,9 +338,11 @@ function Get-DomainComputers {
             $name = $computer.Properties.name[0]
             $dns = $computer.Properties.dnshostname[0]
             $osVer = $computer.Properties.operatingsystemversion[0]
+            $ip = Resolve-HostIP -Hostname $dns
             
             Write-SubSection $name
             Write-Finding "DNS" $dns
+            Write-Finding "IP" $ip -Important
             Write-Finding "OS" "$os $osVer"
         }
     }
@@ -338,9 +354,11 @@ function Get-DomainComputers {
             $name = $computer.Properties.name[0]
             $dns = $computer.Properties.dnshostname[0]
             $osVer = $computer.Properties.operatingsystemversion[0]
+            $ip = Resolve-HostIP -Hostname $dns
 
             Write-SubSection $name
             Write-Finding "DNS" $dns
+            Write-Finding "IP" $ip
             Write-Finding "OS" "$os $osVer"
         }
     }
