@@ -575,3 +575,62 @@ foreach($task in $tasks) {
         Write-Host "    nc -lvnp 4444" -F Gray
     }
 }
+
+# ==========================================
+# SCHEDULED TASKS - INTERESTING USERS
+# ==========================================
+Write-Host "`n============================================" -F Yellow
+Write-Host "  [4b/4] Scheduled Tasks - Interesting Users" -F Yellow
+Write-Host "============================================" -F Yellow
+
+$interestingTasks = schtasks /query /fo CSV /v 2>$null | ConvertFrom-Csv | Where-Object {
+    $_."Scheduled Task State" -eq "Enabled" -and
+    $_."Run As User" -and
+    $_."Run As User" -notmatch '^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE|INTERACTIVE|Users|Administrators|Everyone|Authenticated Users|S-1-|N/A|)$' -and
+    $_."Run As User" -notmatch '^(NT AUTHORITY|BUILTIN|LocalSystem)' -and
+    $_."Run As User" -notmatch [regex]::Escape($me) -and
+    $_."Run As User" -notmatch [regex]::Escape($me.Split('\')[-1]) -and
+    $_."Task To Run" -notmatch '^COM handler'
+}
+
+if($interestingTasks.Count -gt 0) {
+    Write-Host "`n[!] Found $($interestingTasks.Count) tasks running as custom/domain users:" -F Cyan
+    
+    foreach($task in $interestingTasks) {
+        Write-Host "`n----------------------------------------" -F DarkGray
+        Write-Host "[*] Task: $($task.TaskName)" -F White
+        Write-Host "    Run As: $($task.'Run As User')" -F Green
+        Write-Host "    Command: $($task.'Task To Run')" -F Gray
+        Write-Host "    Next Run: $($task.'Next Run Time')"
+        Write-Host "    Last Run: $($task.'Last Run Time')"
+        Write-Host "    Author: $($task.Author)"
+        
+        # Check se il binario esiste e mostra path completo
+        $taskRaw = $task."Task To Run"
+        $taskPath = if($taskRaw -match '^"([^"]+)"') {
+            $matches[1]
+        } elseif($taskRaw -match '^([a-zA-Z]:\\[^\s]+\.\w+)') {
+            $matches[1]
+        } else {
+            $taskRaw.Split()[0]
+        }
+        
+        if($taskPath -and (Test-Path $taskPath -EA 0)) {
+            Write-Host "    Binary exists: $taskPath" -F DarkGray
+            
+            # Mostra ACL del binario
+            $binAcl = icacls $taskPath 2>$null | Out-String
+            if(Test-WritableAcl $binAcl $meEscaped $groups) {
+                Write-Host "    [!] BINARY WRITABLE!" -F Red
+            }
+        }
+    }
+    
+    Write-Host "`n[*] Why interesting:" -F Magenta
+    Write-Host "    - Se puoi modificare il binario -> code execution as that user" -F Gray
+    Write-Host "    - Se l'utente ha privilegi -> privesc" -F Gray
+    Write-Host "    - Se e' domain user -> lateral movement / credential access" -F Gray
+    Write-Host "    - Controlla con: net user <username> /domain" -F Gray
+} else {
+    Write-Host "[*] No tasks running as custom/domain users found" -F DarkGray
+}
