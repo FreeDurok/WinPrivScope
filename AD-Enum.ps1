@@ -1006,8 +1006,27 @@ function Get-ACLAbuse {
         'WriteDacl',
         'Self',
         'ForceChangePassword',
-        'AllExtendedRight'
+        'AllExtendedRights',
+        "ExtendedRight"
     )
+
+    $script:dangerousGUIDs = @(
+        '00000000-0000-0000-0000-000000000000',  # All Extended Rights (questo è il vero AllExtendedRights)
+        '00299570-246d-11d0-a768-00aa006e0529',  # User-Force-Change-Password
+        '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',  # DS-Replication-Get-Changes
+        '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2',  # DS-Replication-Get-Changes-All
+        'ab721a54-1e2f-11d0-9819-00aa0040529b',  # Send-As
+        'ab721a56-1e2f-11d0-9819-00aa0040529b'   # Receive-As
+    )
+
+    $script:guidToName = @{
+    '00000000-0000-0000-0000-000000000000' = 'AllExtendedRights'
+    '00299570-246d-11d0-a768-00aa006e0529' = 'User-Force-Change-Password'
+    '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
+    '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
+    'ab721a54-1e2f-11d0-9819-00aa0040529b' = 'Send-As'
+    'ab721a56-1e2f-11d0-9819-00aa0040529b' = 'Receive-As'
+    }
     
     # SID da ignorare (built-in/system accounts)
     $ignoredSIDs = @(
@@ -1073,6 +1092,7 @@ function Get-ACLAbuse {
             foreach ($ace in $acl) {
                 $rights = $ace.ActiveDirectoryRights.ToString()
                 $sid = $ace.IdentityReference.Value
+                $aceObjectType = $ace.ObjectType.ToString().ToLower()
                 
                 # Salta SID di sistema e gruppi privilegiati
                 if ($sid -in $allIgnored) { continue }
@@ -1081,6 +1101,11 @@ function Get-ACLAbuse {
                 # Controlla se ha permessi pericolosi
                 foreach ($dangerous in $dangerousRights) {
                     if ($rights -match $dangerous) {
+                        $aceGuid = $ace.ObjectType.ToString()
+
+                        if ($dangerous -eq 'ExtendedRight' -and $aceObjectType -notin  $script:dangerousGUIDs) {    
+                            continue
+                        }
                         $principalName = Convert-SIDToName -SID $sid
                         
                         # Ignora se il principal è un gruppo privilegiato
@@ -1091,7 +1116,12 @@ function Get-ACLAbuse {
                             TargetType = $ObjectType
                             Principal = $principalName
                             Rights = $rights
-                            Dangerous = $dangerous
+                            Dangerous = if ($dangerous -eq 'ExtendedRight') { 
+                                $guidName = $script:guidToName[$aceObjectType]
+                                if ($guidName) { $guidName } else { "ExtendedRight ($aceObjectType)" }
+                            } else { 
+                                $dangerous 
+                            }
                         }
                         break
                     }
