@@ -659,6 +659,8 @@ $systemTasks = schtasks /query /fo CSV /v 2>$null | ConvertFrom-Csv | Where-Obje
 if($systemTasks.Count -gt 0) {
     Write-Host "`n[!] Found $($systemTasks.Count) SYSTEM tasks in non-standard paths:" -F Cyan
     
+    $vulnerableSystemTasks = 0
+    
     foreach($task in $systemTasks) {
         $taskRaw = $task."Task To Run"
         
@@ -672,11 +674,15 @@ if($systemTasks.Count -gt 0) {
         } else {
             $taskExpanded.Split()[0]
         }
-        $taskDir = Split-Path $taskPath -Parent
         
-        # Check esistenza e permessi
-        $binExists = Test-Path $taskPath -EA 0
-        $dirExists = Test-Path $taskDir -EA 0
+        # Skip se taskPath è vuoto o non valido
+        if(-not $taskPath -or $taskPath.Length -lt 3) { continue }
+        
+        $taskDir = Split-Path $taskPath -Parent -EA SilentlyContinue
+        
+        # Check esistenza e permessi (verifica che non siano vuoti)
+        $binExists = if($taskPath) { Test-Path $taskPath -EA 0 } else { $false }
+        $dirExists = if($taskDir -and $taskDir.Length -gt 0) { Test-Path $taskDir -EA 0 } else { $false }
         
         # Mostra solo se esiste qualcosa da controllare
         if($binExists -or $dirExists) {
@@ -695,6 +701,7 @@ if($systemTasks.Count -gt 0) {
             
             # Mostra solo se vulnerabile
             if($binWritable -or $dirWritable) {
+                $vulnerableSystemTasks++
                 Write-Host "`n========================================" -F Cyan
                 Write-Host "[!] VULNERABLE SYSTEM TASK: $($task.TaskName)" -F Red
                 Write-Host "========================================" -F Cyan
@@ -721,6 +728,10 @@ if($systemTasks.Count -gt 0) {
                 Write-Host "    schtasks /run /tn `"$($task.TaskName)`"" -F Gray
             }
         }
+    }
+    
+    if($vulnerableSystemTasks -eq 0) {
+        Write-Host "[*] None of the $($systemTasks.Count) SYSTEM tasks are vulnerable (no writable binaries/dirs)" -F DarkGray
     }
 } else {
     Write-Host "[*] No SYSTEM tasks in non-standard paths found" -F DarkGray
