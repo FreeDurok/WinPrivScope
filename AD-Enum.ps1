@@ -360,47 +360,48 @@ function Get-DomainComputers {
     Write-Section "Domain Controllers"
     $dcs = LDAPSearch -LDAPQuery "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))"
     foreach ($dc in $dcs) {
-        $name = $dc.Properties.name[0]
-        $os = $dc.Properties.operatingsystem[0]
-        $osVer = $dc.Properties.operatingsystemversion[0]
-        $dns = $dc.Properties.dnshostname[0]
+        
+        $name = if ($dc.Properties.name) { $dc.Properties.name[0] } else { "N/A" }
+        $os = if ($dc.Properties.operatingsystem) { $dc.Properties.operatingsystem[0] } else { "N/A" }
+        $osVer = if ($dc.Properties.operatingsystemversion) { $dc.Properties.operatingsystemversion[0] } else { "" }
+        $dns = if ($dc.Properties.dnshostname) { $dc.Properties.dnshostname[0] } else { $null }
         $ip = Resolve-HostIP -Hostname $dns
         
         Write-SubSection $name
-        Write-Finding "DNS" $dns
+        Write-Finding "DNS" $(if ($dns) { $dns } else { "N/A" })
         Write-Finding "IP" $ip -Important
-        Write-Finding "OS" "$os $osVer" -Important
+        Write-Finding "OS" "$os $osVer".Trim() -Important
     }
     
     Write-Section "Server"
     foreach ($computer in $computers) {
-        $os = $computer.Properties.operatingsystem[0]
-        if ($os -match "Server" -and $os -notmatch "Domain Controller") {
-            $name = $computer.Properties.name[0]
-            $dns = $computer.Properties.dnshostname[0]
-            $osVer = $computer.Properties.operatingsystemversion[0]
+        $os = if ($computer.Properties.operatingsystem) { $computer.Properties.operatingsystem[0] } else { $null }
+        if ($os -and $os -match "Server" -and $os -notmatch "Domain Controller") {
+            $name = if ($computer.Properties.name) { $computer.Properties.name[0] } else { "N/A" }
+            $dns = if ($computer.Properties.dnshostname) { $computer.Properties.dnshostname[0] } else { $null }
+            $osVer = if ($computer.Properties.operatingsystemversion) { $computer.Properties.operatingsystemversion[0] } else { "" }
             $ip = Resolve-HostIP -Hostname $dns
             
             Write-SubSection $name
-            Write-Finding "DNS" $dns
+            Write-Finding "DNS" $(if ($dns) { $dns } else { "N/A" })
             Write-Finding "IP" $ip -Important
-            Write-Finding "OS" "$os $osVer"
+            Write-Finding "OS" "$os $osVer".Trim()
         }
     }
     
     Write-Section "Workstation"
     foreach ($computer in $computers) {
-        $os = $computer.Properties.operatingsystem[0]
-        if ($os -notmatch "Server") {
-            $name = $computer.Properties.name[0]
-            $dns = $computer.Properties.dnshostname[0]
-            $osVer = $computer.Properties.operatingsystemversion[0]
+        $os = if ($computer.Properties.operatingsystem) { $computer.Properties.operatingsystem[0] } else { $null }
+        if (-not $os -or $os -notmatch "Server") {
+            $name = if ($computer.Properties.name) { $computer.Properties.name[0] } else { "N/A" }
+            $dns = if ($computer.Properties.dnshostname) { $computer.Properties.dnshostname[0] } else { $null }
+            $osVer = if ($computer.Properties.operatingsystemversion) { $computer.Properties.operatingsystemversion[0] } else { "" }
             $ip = Resolve-HostIP -Hostname $dns
 
             Write-SubSection $name
-            Write-Finding "DNS" $dns
+            Write-Finding "DNS" $(if ($dns) { $dns } else { "N/A" })
             Write-Finding "IP" $ip
-            Write-Finding "OS" "$os $osVer"
+            Write-Finding "OS" $(if ($os) { "$os $osVer".Trim() } else { "N/A" })
         }
     }
 }
