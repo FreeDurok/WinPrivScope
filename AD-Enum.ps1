@@ -420,8 +420,8 @@ function Get-OrganizationalUnits {
     foreach ($ou in $ous) {
         $ouDN = $ou.Properties.distinguishedname[0]
         $ouName = $ou.Properties.name[0]
-        $ouDesc = $ou.Properties.description[0]
-        $gpLink = $ou.Properties.gplink[0]
+        $ouDesc = if ($ou.Properties.description) { $ou.Properties.description[0] } else { $null }
+        $gpLink = if ($ou.Properties.gplink) { $ou.Properties.gplink[0] } else { $null }
         
         # Calcola profondità (conta le virgole per determinare il livello)
         $depth = ($ouDN.ToCharArray() | Where-Object { $_ -eq ',' }).Count
@@ -903,8 +903,10 @@ function Get-GPOLinks {
     foreach ($ou in $ous) {
         $ouDN = $ou.Properties.distinguishedname[0]
         $ouName = $ou.Properties.name[0]
-        $gpLink = $ou.Properties.gplink[0]
-        
+        $gpLink = $null
+        if ($ou.Properties.gplink) {
+            $gpLink = $ou.Properties.gplink[0]
+        }        
         if ($gpLink) {
             $linkedObjects += [PSCustomObject]@{
                 Target = $ouName
